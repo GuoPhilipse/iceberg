@@ -31,7 +31,7 @@ import org.apache.hadoop.hive.serde2.typeinfo.DecimalTypeInfo;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 public final class IcebergDecimalObjectInspector extends AbstractPrimitiveJavaObjectInspector
-                                                 implements HiveDecimalObjectInspector {
+    implements HiveDecimalObjectInspector, WriteObjectInspector {
 
   private static final Cache<Integer, IcebergDecimalObjectInspector> CACHE = Caffeine.newBuilder()
           .expireAfterAccess(10, TimeUnit.MINUTES)
@@ -67,8 +67,26 @@ public final class IcebergDecimalObjectInspector extends AbstractPrimitiveJavaOb
       return null;
     }
 
-    HiveDecimal decimal = (HiveDecimal) o;
-    return HiveDecimal.create(decimal.bigDecimalValue());
+    if (o instanceof HiveDecimal) {
+      HiveDecimal decimal = (HiveDecimal) o;
+      return HiveDecimal.create(decimal.bigDecimalValue());
+    } else if (o instanceof BigDecimal) {
+      BigDecimal copy = new BigDecimal(o.toString());
+      return copy;
+    } else {
+      return o;
+    }
   }
 
+  @Override
+  public BigDecimal convert(Object o) {
+    if (o == null) {
+      return null;
+    }
+
+    BigDecimal result = ((HiveDecimal) o).bigDecimalValue();
+    // during the HiveDecimal to BigDecimal conversion the scale is lost, when the value is 0
+    result = result.setScale(scale());
+    return result;
+  }
 }

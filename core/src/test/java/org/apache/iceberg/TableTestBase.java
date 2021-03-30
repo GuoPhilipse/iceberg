@@ -50,7 +50,7 @@ public class TableTestBase {
   );
 
   // Partition spec used to create tables
-  static final PartitionSpec SPEC = PartitionSpec.builderFor(SCHEMA)
+  protected static final PartitionSpec SPEC = PartitionSpec.builderFor(SCHEMA)
       .bucket("data", 16)
       .build();
 
@@ -71,6 +71,14 @@ public class TableTestBase {
       .withPath("/path/to/data-a-deletes.parquet")
       .withFileSizeInBytes(10)
       .withPartitionPath("data_bucket=0") // easy way to set partition data for now
+      .withRecordCount(1)
+      .build();
+  // Equality delete files.
+  static final DeleteFile FILE_A2_DELETES = FileMetadata.deleteFileBuilder(SPEC)
+      .ofEqualityDeletes(3)
+      .withPath("/path/to/data-a2-deletes.parquet")
+      .withFileSizeInBytes(10)
+      .withPartitionPath("data_bucket=0")
       .withRecordCount(1)
       .build();
   static final DataFile FILE_B = DataFiles.builder(SPEC)
@@ -104,8 +112,8 @@ public class TableTestBase {
   @Rule
   public TemporaryFolder temp = new TemporaryFolder();
 
-  File tableDir = null;
-  File metadataDir = null;
+  protected File tableDir = null;
+  protected File metadataDir = null;
   public TestTables.TestTable table = null;
 
   protected final int formatVersion;
@@ -143,7 +151,7 @@ public class TableTestBase {
         !name.startsWith("snap") && Files.getFileExtension(name).equalsIgnoreCase("avro")));
   }
 
-  TestTables.TestTable create(Schema schema, PartitionSpec spec) {
+  protected TestTables.TestTable create(Schema schema, PartitionSpec spec) {
     return TestTables.create(tableDir, "test", schema, spec, formatVersion);
   }
 
@@ -211,6 +219,22 @@ public class TableTestBase {
       writer.close();
     }
 
+    return writer.toManifestFile();
+  }
+
+  ManifestFile writeDeleteManifest(int newFormatVersion, Long snapshotId, DeleteFile... deleteFiles)
+      throws IOException {
+    OutputFile manifestFile = org.apache.iceberg.Files
+        .localOutput(FileFormat.AVRO.addExtension(temp.newFile().toString()));
+    ManifestWriter<DeleteFile> writer = ManifestFiles.writeDeleteManifest(
+        newFormatVersion, SPEC, manifestFile, snapshotId);
+    try {
+      for (DeleteFile deleteFile : deleteFiles) {
+        writer.add(deleteFile);
+      }
+    } finally {
+      writer.close();
+    }
     return writer.toManifestFile();
   }
 

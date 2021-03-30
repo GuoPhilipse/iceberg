@@ -27,11 +27,42 @@ import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectIn
 import org.apache.hadoop.hive.serde2.typeinfo.PrimitiveTypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.common.DynMethods;
+import org.apache.iceberg.hive.MetastoreUtil;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 
 public final class IcebergObjectInspector extends TypeUtil.SchemaVisitor<ObjectInspector> {
+
+  // get the correct inspectors depending on whether we're working with Hive2 or Hive3 dependencies
+  // we need to do this because there is a breaking API change in Date/TimestampObjectInspector between Hive2 and Hive3
+  private static final String DATE_INSPECTOR_CLASS = MetastoreUtil.hive3PresentOnClasspath() ?
+          "org.apache.iceberg.mr.hive.serde.objectinspector.IcebergDateObjectInspectorHive3" :
+          "org.apache.iceberg.mr.hive.serde.objectinspector.IcebergDateObjectInspector";
+
+  public static final ObjectInspector DATE_INSPECTOR = DynMethods.builder("get")
+          .impl(DATE_INSPECTOR_CLASS)
+          .buildStatic()
+          .invoke();
+
+  private static final String TIMESTAMP_INSPECTOR_CLASS = MetastoreUtil.hive3PresentOnClasspath() ?
+          "org.apache.iceberg.mr.hive.serde.objectinspector.IcebergTimestampObjectInspectorHive3" :
+          "org.apache.iceberg.mr.hive.serde.objectinspector.IcebergTimestampObjectInspector";
+
+  private static final String TIMESTAMPTZ_INSPECTOR_CLASS = MetastoreUtil.hive3PresentOnClasspath() ?
+          "org.apache.iceberg.mr.hive.serde.objectinspector.IcebergTimestampWithZoneObjectInspectorHive3" :
+          "org.apache.iceberg.mr.hive.serde.objectinspector.IcebergTimestampWithZoneObjectInspector";
+
+  public static final ObjectInspector TIMESTAMP_INSPECTOR = DynMethods.builder("get")
+          .impl(TIMESTAMP_INSPECTOR_CLASS)
+          .buildStatic()
+          .invoke();
+
+  public static final ObjectInspector TIMESTAMP_INSPECTOR_WITH_TZ = DynMethods.builder("get")
+          .impl(TIMESTAMPTZ_INSPECTOR_CLASS)
+          .buildStatic()
+          .invoke();
 
   public static ObjectInspector create(@Nullable Schema schema) {
     if (schema == null) {
@@ -67,12 +98,12 @@ public final class IcebergObjectInspector extends TypeUtil.SchemaVisitor<ObjectI
 
     switch (primitiveType.typeId()) {
       case BINARY:
-        return IcebergBinaryObjectInspector.byteBuffer();
+        return IcebergBinaryObjectInspector.get();
       case BOOLEAN:
         primitiveTypeInfo = TypeInfoFactory.booleanTypeInfo;
         break;
       case DATE:
-        return IcebergDateObjectInspector.get();
+        return DATE_INSPECTOR;
       case DECIMAL:
         Types.DecimalType type = (Types.DecimalType) primitiveType;
         return IcebergDecimalObjectInspector.get(type.precision(), type.scale());
@@ -80,7 +111,7 @@ public final class IcebergObjectInspector extends TypeUtil.SchemaVisitor<ObjectI
         primitiveTypeInfo = TypeInfoFactory.doubleTypeInfo;
         break;
       case FIXED:
-        return IcebergBinaryObjectInspector.byteArray();
+        return IcebergFixedObjectInspector.get();
       case FLOAT:
         primitiveTypeInfo = TypeInfoFactory.floatTypeInfo;
         break;
@@ -91,14 +122,15 @@ public final class IcebergObjectInspector extends TypeUtil.SchemaVisitor<ObjectI
         primitiveTypeInfo = TypeInfoFactory.longTypeInfo;
         break;
       case STRING:
-      case UUID:
         primitiveTypeInfo = TypeInfoFactory.stringTypeInfo;
         break;
+      case UUID:
+        return IcebergUUIDObjectInspector.get();
       case TIMESTAMP:
         boolean adjustToUTC = ((Types.TimestampType) primitiveType).shouldAdjustToUTC();
-        return IcebergTimestampObjectInspector.get(adjustToUTC);
-
+        return adjustToUTC ? TIMESTAMP_INSPECTOR_WITH_TZ : TIMESTAMP_INSPECTOR;
       case TIME:
+        return IcebergTimeObjectInspector.get();
       default:
         throw new IllegalArgumentException(primitiveType.typeId() + " type is not supported");
     }

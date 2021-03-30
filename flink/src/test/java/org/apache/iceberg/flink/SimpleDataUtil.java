@@ -20,6 +20,7 @@
 package org.apache.iceberg.flink;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import org.apache.flink.table.api.DataTypes;
@@ -28,28 +29,37 @@ import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.types.RowKind;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.flink.sink.RowDataTaskWriterFactory;
+import org.apache.iceberg.deletes.EqualityDeleteWriter;
+import org.apache.iceberg.deletes.PositionDeleteWriter;
+import org.apache.iceberg.encryption.EncryptedOutputFile;
+import org.apache.iceberg.flink.sink.FlinkAppenderFactory;
 import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.FileAppenderFactory;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.HashMultiset;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.Pair;
+import org.apache.iceberg.util.StructLikeSet;
+import org.apache.iceberg.util.StructLikeWrapper;
 import org.junit.Assert;
 
 import static org.apache.iceberg.hadoop.HadoopOutputFile.fromPath;
@@ -94,6 +104,22 @@ public class SimpleDataUtil {
     return GenericRowData.of(id, StringData.fromString(data));
   }
 
+  public static RowData createInsert(Integer id, String data) {
+    return GenericRowData.ofKind(RowKind.INSERT, id, StringData.fromString(data));
+  }
+
+  public static RowData createDelete(Integer id, String data) {
+    return GenericRowData.ofKind(RowKind.DELETE, id, StringData.fromString(data));
+  }
+
+  public static RowData createUpdateBefore(Integer id, String data) {
+    return GenericRowData.ofKind(RowKind.UPDATE_BEFORE, id, StringData.fromString(data));
+  }
+
+  public static RowData createUpdateAfter(Integer id, String data) {
+    return GenericRowData.ofKind(RowKind.UPDATE_AFTER, id, StringData.fromString(data));
+  }
+
   public static DataFile writeFile(Schema schema, PartitionSpec spec, Configuration conf,
                                    String location, String filename, List<RowData> rows)
       throws IOException {
@@ -102,8 +128,8 @@ public class SimpleDataUtil {
     Preconditions.checkNotNull(fileFormat, "Cannot determine format for file: %s", filename);
 
     RowType flinkSchema = FlinkSchemaUtil.convert(schema);
-    FileAppenderFactory<RowData> appenderFactory = new RowDataTaskWriterFactory.FlinkFileAppenderFactory(schema,
-        flinkSchema, ImmutableMap.of());
+    FileAppenderFactory<RowData> appenderFactory =
+        new FlinkAppenderFactory(schema, flinkSchema, ImmutableMap.of(), spec);
 
     FileAppender<RowData> appender = appenderFactory.newAppender(fromPath(path, conf), fileFormat);
     try (FileAppender<RowData> closeableAppender = appender) {
@@ -116,26 +142,104 @@ public class SimpleDataUtil {
         .build();
   }
 
-  public static void assertTableRows(String tablePath, List<RowData> expected) throws IOException {
-    List<Record> expectedRecords = Lists.newArrayList();
-    for (RowData row : expected) {
+  public static DeleteFile writeEqDeleteFile(Table table, FileFormat format, String tablePath, String filename,
+                                             FileAppenderFactory<RowData> appenderFactory,
+                                             List<RowData> deletes) throws IOException {
+    EncryptedOutputFile outputFile =
+        table.encryption().encrypt(fromPath(new Path(tablePath, filename), new Configuration()));
+
+    EqualityDeleteWriter<RowData> eqWriter = appenderFactory.newEqDeleteWriter(outputFile, format, null);
+    try (EqualityDeleteWriter<RowData> writer = eqWriter) {
+      writer.deleteAll(deletes);
+    }
+    return eqWriter.toDeleteFile();
+  }
+
+  public static DeleteFile writePosDeleteFile(Table table, FileFormat format, String tablePath,
+                                              String filename,
+                                              FileAppenderFactory<RowData> appenderFactory,
+                                              List<Pair<CharSequence, Long>> positions) throws IOException {
+    EncryptedOutputFile outputFile =
+        table.encryption().encrypt(fromPath(new Path(tablePath, filename), new Configuration()));
+
+    PositionDeleteWriter<RowData> posWriter = appenderFactory.newPosDeleteWriter(outputFile, format, null);
+    try (PositionDeleteWriter<RowData> writer = posWriter) {
+      for (Pair<CharSequence, Long> p : positions) {
+        writer.delete(p.first(), p.second());
+      }
+    }
+    return posWriter.toDeleteFile();
+  }
+
+  private static List<Record> convertToRecords(List<RowData> rows) {
+    List<Record> records = Lists.newArrayList();
+    for (RowData row : rows) {
       Integer id = row.isNullAt(0) ? null : row.getInt(0);
       String data = row.isNullAt(1) ? null : row.getString(1).toString();
-      expectedRecords.add(createRecord(id, data));
+      records.add(createRecord(id, data));
     }
-    assertTableRecords(tablePath, expectedRecords);
+    return records;
+  }
+
+  public static void assertTableRows(String tablePath, List<RowData> expected) throws IOException {
+    assertTableRecords(tablePath, convertToRecords(expected));
+  }
+
+  public static void assertTableRows(Table table, List<RowData> expected) throws IOException {
+    assertTableRecords(table, convertToRecords(expected));
   }
 
   public static void assertTableRecords(Table table, List<Record> expected) throws IOException {
     table.refresh();
     try (CloseableIterable<Record> iterable = IcebergGenerics.read(table).build()) {
       Assert.assertEquals("Should produce the expected record",
-          Sets.newHashSet(expected), Sets.newHashSet(iterable));
+          HashMultiset.create(expected), HashMultiset.create(iterable));
     }
   }
 
   public static void assertTableRecords(String tablePath, List<Record> expected) throws IOException {
     Preconditions.checkArgument(expected != null, "expected records shouldn't be null");
     assertTableRecords(new HadoopTables().load(tablePath), expected);
+  }
+
+  public static StructLikeSet expectedRowSet(Table table, Record... records) {
+    StructLikeSet set = StructLikeSet.create(table.schema().asStruct());
+    Collections.addAll(set, records);
+    return set;
+  }
+
+  public static StructLikeSet actualRowSet(Table table, String... columns) throws IOException {
+    table.refresh();
+    StructLikeSet set = StructLikeSet.create(table.schema().asStruct());
+    try (CloseableIterable<Record> reader = IcebergGenerics.read(table).select(columns).build()) {
+      reader.forEach(set::add);
+    }
+    return set;
+  }
+
+  public static List<DataFile> partitionDataFiles(Table table, Map<String, Object> partitionValues)
+      throws IOException {
+    table.refresh();
+    Types.StructType spec = table.spec().partitionType();
+
+    Record partitionRecord = GenericRecord.create(spec).copy(partitionValues);
+    StructLikeWrapper expectedWrapper = StructLikeWrapper
+        .forType(spec)
+        .set(partitionRecord);
+
+    List<DataFile> dataFiles = Lists.newArrayList();
+    try (CloseableIterable<FileScanTask> fileScanTasks = table.newScan().planFiles()) {
+      for (FileScanTask scanTask : fileScanTasks) {
+        StructLikeWrapper wrapper = StructLikeWrapper
+            .forType(spec)
+            .set(scanTask.file().partition());
+
+        if (expectedWrapper.equals(wrapper)) {
+          dataFiles.add(scanTask.file());
+        }
+      }
+    }
+
+    return dataFiles;
   }
 }

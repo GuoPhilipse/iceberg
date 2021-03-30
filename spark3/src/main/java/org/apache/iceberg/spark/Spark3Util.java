@@ -21,39 +21,84 @@ package org.apache.iceberg.spark;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.apache.hadoop.fs.Path;
+import org.apache.iceberg.DistributionMode;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.MetadataTableType;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.UpdateProperties;
 import org.apache.iceberg.UpdateSchema;
+import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.expressions.BoundPredicate;
 import org.apache.iceberg.expressions.ExpressionVisitors;
+import org.apache.iceberg.expressions.Term;
 import org.apache.iceberg.expressions.UnboundPredicate;
 import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
+import org.apache.iceberg.spark.SparkTableUtil.SparkPartition;
+import org.apache.iceberg.spark.source.SparkTable;
 import org.apache.iceberg.transforms.PartitionSpecVisitor;
+import org.apache.iceberg.transforms.SortOrderVisitor;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.ArrayUtil;
+import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.PropertyUtil;
+import org.apache.iceberg.util.SortOrderUtil;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RuntimeConfig;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.CatalystTypeConverters;
+import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
+import org.apache.spark.sql.catalyst.parser.ParseException;
+import org.apache.spark.sql.catalyst.parser.ParserInterface;
+import org.apache.spark.sql.connector.catalog.CatalogManager;
+import org.apache.spark.sql.connector.catalog.CatalogPlugin;
+import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.catalog.TableChange;
 import org.apache.spark.sql.connector.expressions.Expression;
 import org.apache.spark.sql.connector.expressions.Expressions;
 import org.apache.spark.sql.connector.expressions.Literal;
 import org.apache.spark.sql.connector.expressions.Transform;
+import org.apache.spark.sql.connector.iceberg.distributions.Distribution;
+import org.apache.spark.sql.connector.iceberg.distributions.Distributions;
+import org.apache.spark.sql.connector.iceberg.distributions.OrderedDistribution;
+import org.apache.spark.sql.connector.iceberg.expressions.SortOrder;
+import org.apache.spark.sql.execution.datasources.FileStatusCache;
+import org.apache.spark.sql.execution.datasources.InMemoryFileIndex;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
 import org.apache.spark.sql.types.IntegerType;
 import org.apache.spark.sql.types.LongType;
+import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
+import scala.Option;
+import scala.Predef;
+import scala.Some;
+import scala.collection.JavaConverters;
+import scala.collection.Seq;
+
+import static org.apache.iceberg.TableProperties.WRITE_DISTRIBUTION_MODE;
+import static org.apache.iceberg.TableProperties.WRITE_DISTRIBUTION_MODE_DEFAULT;
+import static org.apache.iceberg.TableProperties.WRITE_DISTRIBUTION_MODE_RANGE;
 
 public class Spark3Util {
 
@@ -196,6 +241,12 @@ public class Spark3Util {
     }
   }
 
+  public static org.apache.iceberg.Table toIcebergTable(Table table) {
+    Preconditions.checkArgument(table instanceof SparkTable, "Table %s is not an Iceberg table", table);
+    SparkTable sparkTable = (SparkTable) table;
+    return sparkTable.table();
+  }
+
   /**
    * Converts a PartitionSpec to Spark transforms.
    *
@@ -203,7 +254,7 @@ public class Spark3Util {
    * @return an array of Transforms
    */
   public static Transform[] toTransforms(PartitionSpec spec) {
-    List<Transform> transforms = PartitionSpecVisitor.visit(spec.schema(), spec,
+    List<Transform> transforms = PartitionSpecVisitor.visit(spec,
         new PartitionSpecVisitor<Transform>() {
           @Override
           public Transform identity(String sourceName, int sourceId) {
@@ -211,8 +262,8 @@ public class Spark3Util {
           }
 
           @Override
-          public Transform bucket(String sourceName, int sourceId, int width) {
-            return Expressions.bucket(width, sourceName);
+          public Transform bucket(String sourceName, int sourceId, int numBuckets) {
+            return Expressions.bucket(numBuckets, sourceName);
           }
 
           @Override
@@ -239,9 +290,85 @@ public class Spark3Util {
           public Transform hour(String sourceName, int sourceId) {
             return Expressions.hours(sourceName);
           }
+
+          @Override
+          public Transform unknown(int fieldId, String sourceName, int sourceId, String transform) {
+            return Expressions.apply(transform, Expressions.column(sourceName));
+          }
         });
 
     return transforms.toArray(new Transform[0]);
+  }
+
+  public static Distribution buildRequiredDistribution(org.apache.iceberg.Table table) {
+    DistributionMode distributionMode = distributionModeFor(table);
+    switch (distributionMode) {
+      case NONE:
+        return Distributions.unspecified();
+      case HASH:
+        if (table.spec().isUnpartitioned()) {
+          return Distributions.unspecified();
+        } else {
+          return Distributions.clustered(toTransforms(table.spec()));
+        }
+      case RANGE:
+        if (table.spec().isUnpartitioned() && table.sortOrder().isUnsorted()) {
+          return Distributions.unspecified();
+        } else {
+          org.apache.iceberg.SortOrder requiredSortOrder = SortOrderUtil.buildSortOrder(table);
+          return Distributions.ordered(convert(requiredSortOrder));
+        }
+      default:
+        throw new IllegalArgumentException("Unsupported distribution mode: " + distributionMode);
+    }
+  }
+
+  public static SortOrder[] buildRequiredOrdering(Distribution distribution, org.apache.iceberg.Table table) {
+    if (distribution instanceof OrderedDistribution) {
+      OrderedDistribution orderedDistribution = (OrderedDistribution) distribution;
+      return orderedDistribution.ordering();
+    } else {
+      org.apache.iceberg.SortOrder requiredSortOrder = SortOrderUtil.buildSortOrder(table);
+      return convert(requiredSortOrder);
+    }
+  }
+
+  public static DistributionMode distributionModeFor(org.apache.iceberg.Table table) {
+    boolean isSortedTable = !table.sortOrder().isUnsorted();
+    String defaultModeName = isSortedTable ? WRITE_DISTRIBUTION_MODE_RANGE : WRITE_DISTRIBUTION_MODE_DEFAULT;
+    String modeName = table.properties().getOrDefault(WRITE_DISTRIBUTION_MODE, defaultModeName);
+    return DistributionMode.fromName(modeName);
+  }
+
+  public static SortOrder[] convert(org.apache.iceberg.SortOrder sortOrder) {
+    List<OrderField> converted = SortOrderVisitor.visit(sortOrder, new SortOrderToSpark());
+    return converted.toArray(new OrderField[0]);
+  }
+
+  public static Term toIcebergTerm(Transform transform) {
+    Preconditions.checkArgument(transform.references().length == 1,
+        "Cannot convert transform with more than one column reference: %s", transform);
+    String colName = DOT.join(transform.references()[0].fieldNames());
+    switch (transform.name()) {
+      case "identity":
+        return org.apache.iceberg.expressions.Expressions.ref(colName);
+      case "bucket":
+        return org.apache.iceberg.expressions.Expressions.bucket(colName, findWidth(transform));
+      case "years":
+        return org.apache.iceberg.expressions.Expressions.year(colName);
+      case "months":
+        return org.apache.iceberg.expressions.Expressions.month(colName);
+      case "date":
+      case "days":
+        return org.apache.iceberg.expressions.Expressions.day(colName);
+      case "date_hour":
+      case "hours":
+        return org.apache.iceberg.expressions.Expressions.hour(colName);
+      case "truncate":
+        return org.apache.iceberg.expressions.Expressions.truncate(colName, findWidth(transform));
+      default:
+        throw new UnsupportedOperationException("Transform is not supported: " + transform);
+    }
   }
 
   /**
@@ -360,14 +487,39 @@ public class Spark3Util {
     return false;
   }
 
-  public static boolean isVectorizationEnabled(Map<String, String> properties, CaseInsensitiveStringMap readOptions) {
-    return readOptions.getBoolean("vectorization-enabled",
-        PropertyUtil.propertyAsBoolean(properties,
-            TableProperties.PARQUET_VECTORIZATION_ENABLED, TableProperties.PARQUET_VECTORIZATION_ENABLED_DEFAULT));
+  public static boolean isVectorizationEnabled(FileFormat fileFormat,
+                                               Map<String, String> properties,
+                                               RuntimeConfig sessionConf,
+                                               CaseInsensitiveStringMap readOptions) {
+
+    String readOptionValue = readOptions.get(SparkReadOptions.VECTORIZATION_ENABLED);
+    if (readOptionValue != null) {
+      return Boolean.parseBoolean(readOptionValue);
+    }
+
+    String sessionConfValue = sessionConf.get("spark.sql.iceberg.vectorization.enabled", null);
+    if (sessionConfValue != null) {
+      return Boolean.parseBoolean(sessionConfValue);
+    }
+
+    switch (fileFormat) {
+      case PARQUET:
+        return PropertyUtil.propertyAsBoolean(
+            properties,
+            TableProperties.PARQUET_VECTORIZATION_ENABLED,
+            TableProperties.PARQUET_VECTORIZATION_ENABLED_DEFAULT);
+      case ORC:
+        return PropertyUtil.propertyAsBoolean(
+            properties,
+            TableProperties.ORC_VECTORIZATION_ENABLED,
+            TableProperties.ORC_VECTORIZATION_ENABLED_DEFAULT);
+      default:
+        return false;
+    }
   }
 
   public static int batchSize(Map<String, String> properties, CaseInsensitiveStringMap readOptions) {
-    return readOptions.getInt("batch-size",
+    return readOptions.getInt(SparkReadOptions.VECTORIZATION_BATCH_SIZE,
         PropertyUtil.propertyAsInt(properties,
             TableProperties.PARQUET_BATCH_SIZE, TableProperties.PARQUET_BATCH_SIZE_DEFAULT));
   }
@@ -506,6 +658,10 @@ public class Spark3Util {
           return pred.ref().name() + " IS NULL";
         case NOT_NULL:
           return pred.ref().name() + " IS NOT NULL";
+        case IS_NAN:
+          return "is_nan(" + pred.ref().name() + ")";
+        case NOT_NAN:
+          return "not_nan(" + pred.ref().name() + ")";
         case LT:
           return pred.ref().name() + " < " + sqlString(pred.literal());
         case LT_EQ:
@@ -542,5 +698,186 @@ public class Spark3Util {
         return lit.value().toString();
       }
     }
+  }
+
+  /**
+   * Returns a Metadata Table Dataset if it can be loaded from a Spark V2 Catalog
+   *
+   * Because Spark does not allow more than 1 piece in the namespace for a Session Catalog table, we circumvent
+   * the entire resolution path for tables and instead look up the table directly ourselves. This lets us correctly
+   * get metadata tables for the SessionCatalog, if we didn't have to work around this we could just use spark.table.
+   *
+   * @param spark SparkSession used for looking up catalog references and tables
+   * @param name The multipart identifier of the base Iceberg table
+   * @param type The type of metadata table to load
+   * @return null if we cannot find the Metadata Table, a Dataset of rows otherwise
+   */
+  private static Dataset<Row> loadCatalogMetadataTable(SparkSession spark, String name, MetadataTableType type) {
+    try {
+      CatalogAndIdentifier catalogAndIdentifier = catalogAndIdentifier(spark, name);
+      if (catalogAndIdentifier.catalog instanceof BaseCatalog) {
+        BaseCatalog catalog = (BaseCatalog) catalogAndIdentifier.catalog;
+        Identifier baseId = catalogAndIdentifier.identifier;
+        Identifier metaId = Identifier.of(ArrayUtil.add(baseId.namespace(), baseId.name()), type.name());
+        Table metaTable = catalog.loadTable(metaId);
+        return Dataset.ofRows(spark, DataSourceV2Relation.create(metaTable, Some.apply(catalog), Some.apply(metaId)));
+      }
+    } catch (NoSuchTableException | ParseException e) {
+      // Could not find table
+      return null;
+    }
+    // Could not find table
+    return null;
+  }
+
+  public static CatalogAndIdentifier catalogAndIdentifier(SparkSession spark, String name) throws ParseException {
+    return catalogAndIdentifier(spark, name, spark.sessionState().catalogManager().currentCatalog());
+  }
+
+  public static CatalogAndIdentifier catalogAndIdentifier(SparkSession spark, String name,
+                                                          CatalogPlugin defaultCatalog) throws ParseException {
+    ParserInterface parser = spark.sessionState().sqlParser();
+    Seq<String> multiPartIdentifier = parser.parseMultipartIdentifier(name);
+    List<String> javaMultiPartIdentifier = JavaConverters.seqAsJavaList(multiPartIdentifier);
+    return catalogAndIdentifier(spark, javaMultiPartIdentifier, defaultCatalog);
+  }
+
+  public static CatalogAndIdentifier catalogAndIdentifier(String description, SparkSession spark, String name) {
+    return catalogAndIdentifier(description, spark, name, spark.sessionState().catalogManager().currentCatalog());
+  }
+
+  public static CatalogAndIdentifier catalogAndIdentifier(String description, SparkSession spark,
+                                                          String name, CatalogPlugin defaultCatalog) {
+    try {
+      return catalogAndIdentifier(spark, name, defaultCatalog);
+    } catch (ParseException e) {
+      throw new IllegalArgumentException("Cannot parse " + description + ": " + name, e);
+    }
+  }
+
+  public static CatalogAndIdentifier catalogAndIdentifier(SparkSession spark, List<String> nameParts) {
+    return catalogAndIdentifier(spark, nameParts, spark.sessionState().catalogManager().currentCatalog());
+  }
+
+  /**
+   * A modified version of Spark's LookupCatalog.CatalogAndIdentifier.unapply
+   * Attempts to find the catalog and identifier a multipart identifier represents
+   * @param spark Spark session to use for resolution
+   * @param nameParts Multipart identifier representing a table
+   * @param defaultCatalog Catalog to use if none is specified
+   * @return The CatalogPlugin and Identifier for the table
+   */
+  public static CatalogAndIdentifier catalogAndIdentifier(SparkSession spark, List<String> nameParts,
+                                                          CatalogPlugin defaultCatalog) {
+    CatalogManager catalogManager = spark.sessionState().catalogManager();
+
+    String[] currentNamespace;
+    if (defaultCatalog.equals(catalogManager.currentCatalog())) {
+      currentNamespace = catalogManager.currentNamespace();
+    } else {
+      currentNamespace = defaultCatalog.defaultNamespace();
+    }
+
+    Pair<CatalogPlugin, Identifier> catalogIdentifier = SparkUtil.catalogAndIdentifier(nameParts,
+        catalogName ->  {
+          try {
+            return catalogManager.catalog(catalogName);
+          } catch (Exception e) {
+            return null;
+          }
+        },
+        Identifier::of,
+        defaultCatalog,
+        currentNamespace
+    );
+    return new CatalogAndIdentifier(catalogIdentifier);
+  }
+
+  /**
+   * This mimics a class inside of Spark which is private inside of LookupCatalog.
+   */
+  public static class CatalogAndIdentifier {
+    private final CatalogPlugin catalog;
+    private final Identifier identifier;
+
+
+    public CatalogAndIdentifier(CatalogPlugin catalog, Identifier identifier) {
+      this.catalog = catalog;
+      this.identifier = identifier;
+    }
+
+    public CatalogAndIdentifier(Pair<CatalogPlugin, Identifier> identifier) {
+      this.catalog = identifier.first();
+      this.identifier = identifier.second();
+    }
+
+    public CatalogPlugin catalog() {
+      return catalog;
+    }
+
+    public Identifier identifier() {
+      return identifier;
+    }
+  }
+
+  public static TableIdentifier identifierToTableIdentifier(Identifier identifier) {
+    return TableIdentifier.of(Namespace.of(identifier.namespace()), identifier.name());
+  }
+
+  /**
+   * Use Spark to list all partitions in the table.
+   *
+   * @param spark a Spark session
+   * @param rootPath a table identifier
+   * @param format format of the file
+   * @return all table's partitions
+   */
+  public static List<SparkPartition> getPartitions(SparkSession spark, Path rootPath, String format) {
+    FileStatusCache fileStatusCache = FileStatusCache.getOrCreate(spark);
+    Map<String, String> emptyMap = Collections.emptyMap();
+
+    InMemoryFileIndex fileIndex = new InMemoryFileIndex(
+        spark,
+        JavaConverters
+            .collectionAsScalaIterableConverter(ImmutableList.of(rootPath))
+            .asScala()
+            .toSeq(),
+        JavaConverters
+            .mapAsScalaMapConverter(emptyMap)
+            .asScala()
+            .toMap(Predef.conforms()),
+        Option.empty(),
+        fileStatusCache,
+        Option.empty(),
+        Option.empty());
+
+    org.apache.spark.sql.execution.datasources.PartitionSpec spec = fileIndex.partitionSpec();
+    StructType schema = spec.partitionColumns();
+
+    return JavaConverters
+        .seqAsJavaListConverter(spec.partitions())
+        .asJava()
+        .stream()
+        .map(partition -> {
+          Map<String, String> values = new HashMap<>();
+          JavaConverters.asJavaIterableConverter(schema).asJava().forEach(field -> {
+            int fieldIndex = schema.fieldIndex(field.name());
+            Object catalystValue = partition.values().get(fieldIndex, field.dataType());
+            Object value = CatalystTypeConverters.convertToScala(catalystValue, field.dataType());
+            values.put(field.name(), value.toString());
+          });
+          return new SparkPartition(values, partition.path().toString(), format);
+        }).collect(Collectors.toList());
+  }
+
+  public static org.apache.spark.sql.catalyst.TableIdentifier toV1TableIdentifier(Identifier identifier) {
+    String[] namespace = identifier.namespace();
+
+    Preconditions.checkArgument(namespace.length <= 1,
+        "Cannot convert %s to a Spark v1 identifier, namespace contains more than 1 part", identifier);
+
+    String table = identifier.name();
+    Option<String> database = namespace.length == 1 ? Option.apply(namespace[0]) : Option.empty();
+    return org.apache.spark.sql.catalyst.TableIdentifier.apply(table, database);
   }
 }

@@ -193,10 +193,12 @@ public abstract class TestSparkDataFile {
     Assert.assertEquals("Size must match", expected.fileSizeInBytes(), actual.fileSizeInBytes());
     Assert.assertEquals("Record value counts must match", expected.valueCounts(), actual.valueCounts());
     Assert.assertEquals("Record null value counts must match", expected.nullValueCounts(), actual.nullValueCounts());
+    Assert.assertEquals("Record nan value counts must match", expected.nanValueCounts(), actual.nanValueCounts());
     Assert.assertEquals("Lower bounds must match", expected.lowerBounds(), actual.lowerBounds());
     Assert.assertEquals("Upper bounds must match", expected.upperBounds(), actual.upperBounds());
     Assert.assertEquals("Key metadata must match", expected.keyMetadata(), actual.keyMetadata());
     Assert.assertEquals("Split offsets must match", expected.splitOffsets(), actual.splitOffsets());
+    Assert.assertEquals("Sort order id must match", expected.sortOrderId(), actual.sortOrderId());
 
     checkStructLike(expected.partition(), actual.partition());
   }

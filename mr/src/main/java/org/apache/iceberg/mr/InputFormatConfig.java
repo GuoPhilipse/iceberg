@@ -19,11 +19,13 @@
 
 package org.apache.iceberg.mr;
 
+import java.util.List;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.util.SerializationUtil;
 
 public class InputFormatConfig {
 
@@ -32,7 +34,6 @@ public class InputFormatConfig {
 
   // configuration values for Iceberg input formats
   public static final String REUSE_CONTAINERS = "iceberg.mr.reuse.containers";
-  public static final String CASE_SENSITIVE = "iceberg.mr.case.sensitive";
   public static final String SKIP_RESIDUAL_FILTERING = "skip.residual.filtering";
   public static final String AS_OF_TIMESTAMP = "iceberg.mr.as.of.time";
   public static final String FILTER_EXPRESSION = "iceberg.mr.filter.expression";
@@ -40,14 +41,28 @@ public class InputFormatConfig {
   public static final String READ_SCHEMA = "iceberg.mr.read.schema";
   public static final String SNAPSHOT_ID = "iceberg.mr.snapshot.id";
   public static final String SPLIT_SIZE = "iceberg.mr.split.size";
+  public static final String SCHEMA_AUTO_CONVERSION = "iceberg.mr.schema.auto.conversion";
   public static final String TABLE_IDENTIFIER = "iceberg.mr.table.identifier";
   public static final String TABLE_LOCATION = "iceberg.mr.table.location";
   public static final String TABLE_SCHEMA = "iceberg.mr.table.schema";
   public static final String PARTITION_SPEC = "iceberg.mr.table.partition.spec";
+  public static final String SERIALIZED_TABLE_PREFIX = "iceberg.mr.serialized.table.";
   public static final String LOCALITY = "iceberg.mr.locality";
   public static final String CATALOG = "iceberg.mr.catalog";
   public static final String HADOOP_CATALOG_WAREHOUSE_LOCATION = "iceberg.mr.catalog.hadoop.warehouse.location";
   public static final String CATALOG_LOADER_CLASS = "iceberg.mr.catalog.loader.class";
+  public static final String SELECTED_COLUMNS = "iceberg.mr.selected.columns";
+  public static final String EXTERNAL_TABLE_PURGE = "external.table.purge";
+
+  public static final String OUTPUT_TABLES = "iceberg.mr.output.tables";
+  public static final String COMMIT_TABLE_THREAD_POOL_SIZE = "iceberg.mr.commit.table.thread.pool.size";
+  public static final int COMMIT_TABLE_THREAD_POOL_SIZE_DEFAULT = 10;
+  public static final String COMMIT_FILE_THREAD_POOL_SIZE = "iceberg.mr.commit.file.thread.pool.size";
+  public static final int COMMIT_FILE_THREAD_POOL_SIZE_DEFAULT = 10;
+  public static final String WRITE_TARGET_FILE_SIZE = "iceberg.mr.write.target.file.size";
+
+  public static final String CASE_SENSITIVE = "iceberg.mr.case.sensitive";
+  public static final boolean CASE_SENSITIVE_DEFAULT = true;
 
   public static final String CATALOG_NAME = "iceberg.catalog";
   public static final String HADOOP_CATALOG = "hadoop.catalog";
@@ -70,7 +85,7 @@ public class InputFormatConfig {
       this.conf = conf;
       // defaults
       conf.setBoolean(SKIP_RESIDUAL_FILTERING, false);
-      conf.setBoolean(CASE_SENSITIVE, true);
+      conf.setBoolean(CASE_SENSITIVE, CASE_SENSITIVE_DEFAULT);
       conf.setBoolean(REUSE_CONTAINERS, false);
       conf.setBoolean(LOCALITY, false);
     }
@@ -91,6 +106,16 @@ public class InputFormatConfig {
 
     public ConfigBuilder schema(Schema schema) {
       conf.set(TABLE_SCHEMA, SchemaParser.toJson(schema));
+      return this;
+    }
+
+    public ConfigBuilder select(List<String> columns) {
+      conf.setStrings(SELECTED_COLUMNS, columns.toArray(new String[0]));
+      return this;
+    }
+
+    public ConfigBuilder select(String... columns) {
+      conf.setStrings(SELECTED_COLUMNS, columns);
       return this;
     }
 
@@ -162,6 +187,24 @@ public class InputFormatConfig {
       conf.setBoolean(InputFormatConfig.SKIP_RESIDUAL_FILTERING, true);
       return this;
     }
+  }
+
+  public static Schema tableSchema(Configuration conf) {
+    return schema(conf, InputFormatConfig.TABLE_SCHEMA);
+  }
+
+  public static Schema readSchema(Configuration conf) {
+    return schema(conf, InputFormatConfig.READ_SCHEMA);
+  }
+
+  public static String[] selectedColumns(Configuration conf) {
+    String[] readColumns = conf.getStrings(InputFormatConfig.SELECTED_COLUMNS);
+    return readColumns != null && readColumns.length > 0 ? readColumns : null;
+  }
+
+  private static Schema schema(Configuration conf, String key) {
+    String json = conf.get(key);
+    return json == null ? null : SchemaParser.fromJson(json);
   }
 
 }

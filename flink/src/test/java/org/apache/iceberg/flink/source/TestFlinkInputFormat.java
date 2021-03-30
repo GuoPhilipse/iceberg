@@ -24,11 +24,7 @@ import java.util.List;
 import java.util.Map;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.TableSchema;
-import org.apache.flink.table.data.RowData;
-import org.apache.flink.table.data.conversion.DataStructureConverter;
-import org.apache.flink.table.data.conversion.DataStructureConverters;
 import org.apache.flink.table.types.logical.RowType;
-import org.apache.flink.table.types.utils.TypeConversions;
 import org.apache.flink.types.Row;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
@@ -37,7 +33,7 @@ import org.apache.iceberg.data.GenericAppenderHelper;
 import org.apache.iceberg.data.RandomGenericData;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.flink.FlinkSchemaUtil;
-import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.TestHelpers;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
 import org.junit.Test;
@@ -47,7 +43,7 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 /**
  * Test {@link FlinkInputFormat}.
  */
-public class TestFlinkInputFormat extends TestFlinkScan {
+public class TestFlinkInputFormat extends TestFlinkSource {
 
   public TestFlinkInputFormat(String fileFormat) {
     super(fileFormat);
@@ -58,15 +54,11 @@ public class TestFlinkInputFormat extends TestFlinkScan {
     super.before();
   }
 
-  private TableLoader loader() {
-    return TableLoader.fromHadoopTable(warehouse + "/default/t");
-  }
-
   @Override
   protected List<Row> run(
       FlinkSource.Builder formatBuilder, Map<String, String> sqlOptions, String sqlFilter, String... sqlSelectedFields)
-      throws IOException {
-    return runFormat(formatBuilder.tableLoader(loader()).buildFormat());
+      throws Exception {
+    return runFormat(formatBuilder.tableLoader(tableLoader()).buildFormat());
   }
 
   @Test
@@ -92,7 +84,10 @@ public class TestFlinkInputFormat extends TestFlinkScan {
     TableSchema projectedSchema = TableSchema.builder()
         .field("nested", DataTypes.ROW(DataTypes.FIELD("f2", DataTypes.STRING())))
         .field("data", DataTypes.STRING()).build();
-    List<Row> result = runFormat(FlinkSource.forRowData().tableLoader(loader()).project(projectedSchema).buildFormat());
+    List<Row> result = runFormat(FlinkSource.forRowData()
+        .tableLoader(tableLoader())
+        .project(projectedSchema)
+        .buildFormat());
 
     List<Row> expected = Lists.newArrayList();
     for (Record record : writeRecords) {
@@ -100,26 +95,39 @@ public class TestFlinkInputFormat extends TestFlinkScan {
       expected.add(Row.of(nested, record.get(0)));
     }
 
-    assertRows(result, expected);
+    TestHelpers.assertRows(result, expected);
+  }
+
+  @Test
+  public void testBasicProjection() throws IOException {
+    Schema writeSchema = new Schema(
+        Types.NestedField.required(0, "id", Types.LongType.get()),
+        Types.NestedField.optional(1, "data", Types.StringType.get()),
+        Types.NestedField.optional(2, "time", Types.TimestampType.withZone())
+    );
+
+    Table table = catalog.createTable(TableIdentifier.of("default", "t"), writeSchema);
+
+    List<Record> writeRecords = RandomGenericData.generate(writeSchema, 2, 0L);
+    new GenericAppenderHelper(table, fileFormat, TEMPORARY_FOLDER).appendToTable(writeRecords);
+
+    TableSchema projectedSchema = TableSchema.builder()
+        .field("id", DataTypes.BIGINT())
+        .field("data", DataTypes.STRING())
+        .build();
+    List<Row> result = runFormat(FlinkSource.forRowData()
+        .tableLoader(tableLoader()).project(projectedSchema).buildFormat());
+
+    List<Row> expected = Lists.newArrayList();
+    for (Record record : writeRecords) {
+      expected.add(Row.of(record.get(0), record.get(1)));
+    }
+
+    TestHelpers.assertRows(result, expected);
   }
 
   private List<Row> runFormat(FlinkInputFormat inputFormat) throws IOException {
-    FlinkInputSplit[] splits = inputFormat.createInputSplits(0);
-    List<Row> results = Lists.newArrayList();
-
     RowType rowType = FlinkSchemaUtil.convert(inputFormat.projectedSchema());
-
-    DataStructureConverter<Object, Object> converter = DataStructureConverters.getConverter(
-        TypeConversions.fromLogicalToDataType(rowType));
-
-    for (FlinkInputSplit s : splits) {
-      inputFormat.open(s);
-      while (!inputFormat.reachedEnd()) {
-        RowData row = inputFormat.nextRecord(null);
-        results.add((Row) converter.toExternal(row));
-      }
-    }
-    inputFormat.close();
-    return results;
+    return TestHelpers.readRows(inputFormat, rowType);
   }
 }

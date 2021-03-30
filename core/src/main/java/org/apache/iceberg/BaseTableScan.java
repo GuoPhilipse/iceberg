@@ -44,9 +44,8 @@ import org.slf4j.LoggerFactory;
 /**
  * Base class for {@link TableScan} implementations.
  */
-@SuppressWarnings("checkstyle:OverloadMethodsDeclarationOrder")
 abstract class BaseTableScan implements TableScan {
-  private static final Logger LOG = LoggerFactory.getLogger(TableScan.class);
+  private static final Logger LOG = LoggerFactory.getLogger(BaseTableScan.class);
 
   private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
@@ -93,9 +92,6 @@ abstract class BaseTableScan implements TableScan {
   protected  TableScanContext context() {
     return context;
   }
-
-  @SuppressWarnings("checkstyle:HiddenField")
-  protected abstract long targetSplitSize(TableOperations ops);
 
   @SuppressWarnings("checkstyle:HiddenField")
   protected abstract TableScan newRefinedScan(
@@ -207,7 +203,7 @@ abstract class BaseTableScan implements TableScan {
           context.rowFilter());
 
       Listeners.notifyAll(
-          new ScanEvent(table.toString(), snapshot.snapshotId(), context.rowFilter(), schema()));
+          new ScanEvent(table.name(), snapshot.snapshotId(), context.rowFilter(), schema()));
 
       return planFiles(ops, snapshot,
           context.rowFilter(), context.ignoreResiduals(), context.caseSensitive(), context.returnColumnStats());
@@ -225,7 +221,7 @@ abstract class BaseTableScan implements TableScan {
     if (options.containsKey(TableProperties.SPLIT_SIZE)) {
       splitSize = Long.parseLong(options.get(TableProperties.SPLIT_SIZE));
     } else {
-      splitSize = targetSplitSize(ops);
+      splitSize = targetSplitSize();
     }
     int lookback;
     if (options.containsKey(TableProperties.SPLIT_LOOKBACK)) {

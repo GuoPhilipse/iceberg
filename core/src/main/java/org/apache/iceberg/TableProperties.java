@@ -36,6 +36,9 @@ public class TableProperties {
   public static final String COMMIT_TOTAL_RETRY_TIME_MS = "commit.retry.total-timeout-ms";
   public static final int COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT = 1800000; // 30 minutes
 
+  public static final String COMMIT_NUM_STATUS_CHECKS = "commit.num-status-checks";
+  public static final int COMMIT_NUM_STATUS_CHECKS_DEFAULT = 3;
+
   public static final String MANIFEST_TARGET_SIZE_BYTES = "commit.manifest.target-size-bytes";
   public static final long MANIFEST_TARGET_SIZE_BYTES_DEFAULT = 8388608; // 8 MB
 
@@ -84,10 +87,15 @@ public class TableProperties {
   public static final String PARQUET_BATCH_SIZE = "read.parquet.vectorization.batch-size";
   public static final int PARQUET_BATCH_SIZE_DEFAULT = 5000;
 
+  public static final String ORC_VECTORIZATION_ENABLED = "read.orc.vectorization.enabled";
+  public static final boolean ORC_VECTORIZATION_ENABLED_DEFAULT = false;
+
   public static final String OBJECT_STORE_ENABLED = "write.object-storage.enabled";
   public static final boolean OBJECT_STORE_ENABLED_DEFAULT = false;
 
   public static final String OBJECT_STORE_PATH = "write.object-storage.path";
+
+  public static final String WRITE_LOCATION_PROVIDER_IMPL = "write.location-provider.impl";
 
   // This only applies to files written after this property is set. Files previously written aren't
   // relocated to reflect this parameter.
@@ -98,6 +106,9 @@ public class TableProperties {
   // relocated to reflect this parameter.
   // If not set, defaults to a "metadata" folder underneath the root path of the table.
   public static final String WRITE_METADATA_LOCATION = "write.metadata.path";
+
+  public static final String WRITE_PARTITION_SUMMARY_LIMIT = "write.summary.partition-limit";
+  public static final int WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT = 0;
 
   public static final String MANIFEST_LISTS_ENABLED = "write.manifest-lists.enabled";
   public static final boolean MANIFEST_LISTS_ENABLED_DEFAULT = true;
@@ -122,8 +133,50 @@ public class TableProperties {
   public static final String WRITE_AUDIT_PUBLISH_ENABLED_DEFAULT = "false";
 
   public static final String WRITE_TARGET_FILE_SIZE_BYTES = "write.target-file-size-bytes";
-  public static final long WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT = Long.MAX_VALUE;
+  public static final long WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT = 536870912; // 512 MB
+
+  public static final String SPARK_WRITE_PARTITIONED_FANOUT_ENABLED = "write.spark.fanout.enabled";
+  public static final boolean SPARK_WRITE_PARTITIONED_FANOUT_ENABLED_DEFAULT = false;
 
   public static final String SNAPSHOT_ID_INHERITANCE_ENABLED = "compatibility.snapshot-id-inheritance.enabled";
   public static final boolean SNAPSHOT_ID_INHERITANCE_ENABLED_DEFAULT = false;
+
+  public static final String ENGINE_HIVE_ENABLED = "engine.hive.enabled";
+  public static final boolean ENGINE_HIVE_ENABLED_DEFAULT = false;
+
+  public static final String WRITE_DISTRIBUTION_MODE = "write.distribution-mode";
+  public static final String WRITE_DISTRIBUTION_MODE_NONE = "none";
+  public static final String WRITE_DISTRIBUTION_MODE_HASH = "hash";
+  public static final String WRITE_DISTRIBUTION_MODE_RANGE = "range";
+  public static final String WRITE_DISTRIBUTION_MODE_DEFAULT = WRITE_DISTRIBUTION_MODE_NONE;
+
+  public static final String GC_ENABLED = "gc.enabled";
+  public static final boolean GC_ENABLED_DEFAULT = true;
+
+  public static final String MAX_SNAPSHOT_AGE_MS = "history.expire.max-snapshot-age-ms";
+  public static final long MAX_SNAPSHOT_AGE_MS_DEFAULT = 5 * 24 * 60 * 60 * 1000; // 5 days
+
+  public static final String MIN_SNAPSHOTS_TO_KEEP = "history.expire.min-snapshots-to-keep";
+  public static final int MIN_SNAPSHOTS_TO_KEEP_DEFAULT = 1;
+
+  public static final String DELETE_ISOLATION_LEVEL = "write.delete.isolation-level";
+  public static final String DELETE_ISOLATION_LEVEL_DEFAULT = "serializable";
+
+  public static final String DELETE_MODE = "write.delete.mode";
+  public static final String DELETE_MODE_DEFAULT = "copy-on-write";
+
+  public static final String UPDATE_ISOLATION_LEVEL = "write.update.isolation-level";
+  public static final String UPDATE_ISOLATION_LEVEL_DEFAULT = "serializable";
+
+  public static final String UPDATE_MODE = "write.update.mode";
+  public static final String UPDATE_MODE_DEFAULT = "copy-on-write";
+
+  public static final String MERGE_ISOLATION_LEVEL = "write.merge.isolation-level";
+  public static final String MERGE_ISOLATION_LEVEL_DEFAULT = "serializable";
+
+  public static final String MERGE_MODE = "write.merge.mode";
+  public static final String MERGE_MODE_DEFAULT = "copy-on-write";
+
+  public static final String MERGE_CARDINALITY_CHECK_ENABLED = "write.merge.cardinality-check.enabled";
+  public static final boolean MERGE_CARDINALITY_CHECK_ENABLED_DEFAULT = true;
 }

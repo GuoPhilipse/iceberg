@@ -94,14 +94,14 @@ class OrcFileAppender<D> implements FileAppender<D> {
   public Metrics metrics() {
     Preconditions.checkState(isClosed,
         "Cannot return metrics while appending to an open file.");
-    return OrcMetrics.fromWriter(writer, metricsConfig);
+    return OrcMetrics.fromWriter(writer, valueWriter.metrics(), metricsConfig);
   }
 
   @Override
   public long length() {
     Preconditions.checkState(isClosed,
         "Cannot return length while appending to an open file.");
-    return writer.getRawDataSize();
+    return file.toInputFile().getLength();
   }
 
   @Override

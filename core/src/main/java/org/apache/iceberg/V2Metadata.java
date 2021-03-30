@@ -81,7 +81,7 @@ class V2Metadata {
 
     @Override
     public void put(int i, Object v) {
-      throw new UnsupportedOperationException("Cannot read using IndexedManifestFile");
+      throw new UnsupportedOperationException("Cannot modify IndexedManifestFile wrapper via put");
     }
 
     @Override
@@ -250,11 +250,13 @@ class V2Metadata {
         DataFile.COLUMN_SIZES,
         DataFile.VALUE_COUNTS,
         DataFile.NULL_VALUE_COUNTS,
+        DataFile.NAN_VALUE_COUNTS,
         DataFile.LOWER_BOUNDS,
         DataFile.UPPER_BOUNDS,
         DataFile.KEY_METADATA,
         DataFile.SPLIT_OFFSETS,
-        DataFile.EQUALITY_IDS
+        DataFile.EQUALITY_IDS,
+        DataFile.SORT_ORDER_ID
     );
   }
 
@@ -282,7 +284,7 @@ class V2Metadata {
 
     @Override
     public void put(int i, Object v) {
-      throw new UnsupportedOperationException("Cannot read using IndexedManifestEntry");
+      throw new UnsupportedOperationException("Cannot modify IndexedManifestEntry wrapper via put");
     }
 
     @Override
@@ -397,22 +399,31 @@ class V2Metadata {
         case 8:
           return wrapped.nullValueCounts();
         case 9:
-          return wrapped.lowerBounds();
+          return wrapped.nanValueCounts();
         case 10:
-          return wrapped.upperBounds();
+          return wrapped.lowerBounds();
         case 11:
-          return wrapped.keyMetadata();
+          return wrapped.upperBounds();
         case 12:
-          return wrapped.splitOffsets();
+          return wrapped.keyMetadata();
         case 13:
+          return wrapped.splitOffsets();
+        case 14:
           return wrapped.equalityFieldIds();
+        case 15:
+          return wrapped.sortOrderId();
       }
       throw new IllegalArgumentException("Unknown field ordinal: " + pos);
     }
 
     @Override
     public void put(int i, Object v) {
-      throw new UnsupportedOperationException("Cannot read into IndexedDataFile");
+      throw new UnsupportedOperationException("Cannot modify IndexedDataFile wrapper via put");
+    }
+
+    @Override
+    public Long pos() {
+      return null;
     }
 
     @Override
@@ -466,6 +477,11 @@ class V2Metadata {
     }
 
     @Override
+    public Map<Integer, Long> nanValueCounts() {
+      return wrapped.nanValueCounts();
+    }
+
+    @Override
     public Map<Integer, ByteBuffer> lowerBounds() {
       return wrapped.lowerBounds();
     }
@@ -488,6 +504,11 @@ class V2Metadata {
     @Override
     public List<Integer> equalityFieldIds() {
       return wrapped.equalityFieldIds();
+    }
+
+    @Override
+    public Integer sortOrderId() {
+      return wrapped.sortOrderId();
     }
 
     @Override

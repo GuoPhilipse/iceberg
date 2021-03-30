@@ -80,6 +80,16 @@ public class AllDataFilesTable extends BaseMetadataTable {
     }
   }
 
+  @Override
+  String metadataLocation() {
+    return ops.current().metadataFileLocation();
+  }
+
+  @Override
+  MetadataTableType metadataTableType() {
+    return MetadataTableType.ALL_DATA_FILES;
+  }
+
   public static class AllDataFilesTableScan extends BaseAllMetadataTableScan {
     private final Schema fileSchema;
 
@@ -110,8 +120,8 @@ public class AllDataFilesTable extends BaseMetadataTable {
     }
 
     @Override
-    protected long targetSplitSize(TableOperations ops) {
-      return ops.current().propertyAsLong(
+    public long targetSplitSize() {
+      return tableOps().current().propertyAsLong(
           TableProperties.METADATA_SPLIT_SIZE, TableProperties.METADATA_SPLIT_SIZE_DEFAULT);
     }
 
@@ -136,7 +146,8 @@ public class AllDataFilesTable extends BaseMetadataTable {
 
   private static CloseableIterable<ManifestFile> allDataManifestFiles(List<Snapshot> snapshots) {
     try (CloseableIterable<ManifestFile> iterable = new ParallelIterable<>(
-        Iterables.transform(snapshots, Snapshot::dataManifests), ThreadPools.getWorkerPool())) {
+        Iterables.transform(snapshots, snapshot -> (Iterable<ManifestFile>) () -> snapshot.dataManifests().iterator()),
+        ThreadPools.getWorkerPool())) {
       return CloseableIterable.withNoopClose(Sets.newHashSet(iterable));
     } catch (IOException e) {
       throw new RuntimeIOException(e, "Failed to close parallel iterable");

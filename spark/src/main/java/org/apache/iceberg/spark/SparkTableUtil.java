@@ -28,6 +28,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -56,6 +57,7 @@ import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.orc.OrcMetrics;
 import org.apache.iceberg.parquet.ParquetUtil;
+import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Objects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -102,6 +104,8 @@ import static org.apache.spark.sql.functions.col;
  * https://github.com/apache/iceberg/blob/apache-iceberg-0.8.0-incubating/spark/src/main/scala/org/apache/iceberg/spark/SparkTableUtil.scala
  */
 public class SparkTableUtil {
+
+  private static final Joiner.MapJoiner MAP_JOINER = Joiner.on(",").withKeyValueSeparator("=");
 
   private static final PathFilter HIDDEN_PATH_FILTER =
       p -> !p.getName().startsWith("_") && !p.getName().startsWith(".");
@@ -301,9 +305,12 @@ public class SparkTableUtil {
 
   /**
    * Returns the data files in a partition by listing the partition location.
-   *
+   * <p>
    * For Parquet and ORC partitions, this will read metrics from the file footer. For Avro partitions,
    * metrics are set to null.
+   * <p>
+   * Note: certain metrics, like NaN counts, that are only supported by iceberg file writers but not file footers, will
+   * not be populated.
    *
    * @param partition partition key, e.g., "a=1/b=2"
    * @param uri partition location URI
@@ -328,8 +335,8 @@ public class SparkTableUtil {
     }
   }
 
-  private static List<DataFile> listAvroPartition(
-      Map<String, String> partitionPath, String partitionUri, PartitionSpec spec, Configuration conf) {
+  private static List<DataFile> listAvroPartition(Map<String, String> partitionPath, String partitionUri,
+                                                  PartitionSpec spec, Configuration conf) {
     try {
       Path partition = new Path(partitionUri);
       FileSystem fs = partition.getFileSystem(conf);
@@ -369,7 +376,7 @@ public class SparkTableUtil {
             Metrics metrics;
             try {
               ParquetMetadata metadata = ParquetFileReader.readFooter(conf, stat);
-              metrics = ParquetUtil.footerMetrics(metadata, metricsSpec, mapping);
+              metrics = ParquetUtil.footerMetrics(metadata, Stream.empty(), metricsSpec, mapping);
             } catch (IOException e) {
               throw SparkExceptionUtil.toUncheckedException(
                   e, "Unable to read the footer of the parquet file: %s", stat.getPath());
@@ -497,9 +504,10 @@ public class SparkTableUtil {
    * @param sourceTableIdent an identifier of the source Spark table
    * @param targetTable an Iceberg table where to import the data
    * @param stagingDir a staging directory to store temporary manifest files
+   * @param partitionFilter only import partitions whose values match those in the map, can be partially defined
    */
-  public static void importSparkTable(
-      SparkSession spark, TableIdentifier sourceTableIdent, Table targetTable, String stagingDir) {
+  public static void importSparkTable(SparkSession spark, TableIdentifier sourceTableIdent, Table targetTable,
+                                      String stagingDir, Map<String, String> partitionFilter) {
     SessionCatalog catalog = spark.sessionState().catalog();
 
     String db = sourceTableIdent.database().nonEmpty() ?
@@ -518,7 +526,13 @@ public class SparkTableUtil {
         importUnpartitionedSparkTable(spark, sourceTableIdentWithDB, targetTable);
       } else {
         List<SparkPartition> sourceTablePartitions = getPartitions(spark, sourceTableIdent);
-        importSparkPartitions(spark, sourceTablePartitions, targetTable, spec, stagingDir);
+        Preconditions.checkArgument(!sourceTablePartitions.isEmpty(),
+            "Cannot find any partitions in table %s", sourceTableIdent);
+        List<SparkPartition> filteredPartitions = filterPartitions(sourceTablePartitions, partitionFilter);
+        Preconditions.checkArgument(!filteredPartitions.isEmpty(),
+            "Cannot find any partitions which match the given filter. Partition filter is %s",
+            MAP_JOINER.join(partitionFilter));
+        importSparkPartitions(spark, filteredPartitions, targetTable, spec, stagingDir);
       }
     } catch (AnalysisException e) {
       throw SparkExceptionUtil.toUncheckedException(
@@ -526,8 +540,25 @@ public class SparkTableUtil {
     }
   }
 
-  private static void importUnpartitionedSparkTable(
-      SparkSession spark, TableIdentifier sourceTableIdent, Table targetTable) {
+  /**
+   * Import files from an existing Spark table to an Iceberg table.
+   *
+   * The import uses the Spark session to get table metadata. It assumes no
+   * operation is going on the original and target table and thus is not
+   * thread-safe.
+   *
+   * @param spark a Spark session
+   * @param sourceTableIdent an identifier of the source Spark table
+   * @param targetTable an Iceberg table where to import the data
+   * @param stagingDir a staging directory to store temporary manifest files
+   */
+  public static void importSparkTable(SparkSession spark, TableIdentifier sourceTableIdent, Table targetTable,
+                                      String stagingDir) {
+    importSparkTable(spark, sourceTableIdent, targetTable, stagingDir, Collections.emptyMap());
+  }
+
+  private static void importUnpartitionedSparkTable(SparkSession spark, TableIdentifier sourceTableIdent,
+                                                    Table targetTable) {
     try {
       CatalogTable sourceTable = spark.sessionState().catalog().getTableMetadata(sourceTableIdent);
       Option<String> format =
@@ -565,8 +596,8 @@ public class SparkTableUtil {
    * @param spec a partition spec
    * @param stagingDir a staging directory to store temporary manifest files
    */
-  public static void importSparkPartitions(
-      SparkSession spark, List<SparkPartition> partitions, Table targetTable, PartitionSpec spec, String stagingDir) {
+  public static void importSparkPartitions(SparkSession spark, List<SparkPartition> partitions, Table targetTable,
+                                           PartitionSpec spec, String stagingDir) {
     Configuration conf = spark.sessionState().newHadoopConf();
     SerializableConfiguration serializableConf = new SerializableConfiguration(conf);
     int parallelism = Math.min(partitions.size(), spark.sessionState().conf().parallelPartitionDiscoveryParallelism());
@@ -614,6 +645,17 @@ public class SparkTableUtil {
     } catch (Throwable e) {
       deleteManifests(targetTable.io(), manifests);
       throw e;
+    }
+  }
+
+  public static List<SparkPartition> filterPartitions(List<SparkPartition> partitions,
+                                                      Map<String, String> partitionFilter) {
+    if (partitionFilter.isEmpty()) {
+      return partitions;
+    } else {
+      return partitions.stream()
+          .filter(p -> p.getValues().entrySet().containsAll(partitionFilter.entrySet()))
+          .collect(Collectors.toList());
     }
   }
 

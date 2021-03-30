@@ -42,10 +42,12 @@ public class SparkDataFile implements DataFile {
   private final int columnSizesPosition;
   private final int valueCountsPosition;
   private final int nullValueCountsPosition;
+  private final int nanValueCountsPosition;
   private final int lowerBoundsPosition;
   private final int upperBoundsPosition;
   private final int keyMetadataPosition;
   private final int splitOffsetsPosition;
+  private final int sortOrderIdPosition;
   private final Type lowerBoundsType;
   private final Type upperBoundsType;
   private final Type keyMetadataType;
@@ -73,10 +75,12 @@ public class SparkDataFile implements DataFile {
     columnSizesPosition = positions.get("column_sizes");
     valueCountsPosition = positions.get("value_counts");
     nullValueCountsPosition = positions.get("null_value_counts");
+    nanValueCountsPosition = positions.get("nan_value_counts");
     lowerBoundsPosition = positions.get("lower_bounds");
     upperBoundsPosition = positions.get("upper_bounds");
     keyMetadataPosition = positions.get("key_metadata");
     splitOffsetsPosition = positions.get("split_offsets");
+    sortOrderIdPosition = positions.get("sort_order_id");
   }
 
   public SparkDataFile wrap(Row row) {
@@ -85,6 +89,11 @@ public class SparkDataFile implements DataFile {
       this.wrappedPartition.wrap(row.getAs(partitionPosition));
     }
     return this;
+  }
+
+  @Override
+  public Long pos() {
+    return null;
   }
 
   @Override
@@ -134,6 +143,11 @@ public class SparkDataFile implements DataFile {
   }
 
   @Override
+  public Map<Integer, Long> nanValueCounts() {
+    return wrapped.isNullAt(nanValueCountsPosition) ? null : wrapped.getJavaMap(nanValueCountsPosition);
+  }
+
+  @Override
   public Map<Integer, ByteBuffer> lowerBounds() {
     Map<?, ?> lowerBounds = wrapped.isNullAt(lowerBoundsPosition) ? null : wrapped.getJavaMap(lowerBoundsPosition);
     return convert(lowerBoundsType, lowerBounds);
@@ -163,6 +177,11 @@ public class SparkDataFile implements DataFile {
   @Override
   public List<Long> splitOffsets() {
     return wrapped.isNullAt(splitOffsetsPosition) ? null : wrapped.getList(splitOffsetsPosition);
+  }
+
+  @Override
+  public Integer sortOrderId() {
+    return wrapped.getAs(sortOrderIdPosition);
   }
 
   private int fieldPosition(String name, StructType sparkType) {

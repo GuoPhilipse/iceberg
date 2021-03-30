@@ -72,6 +72,16 @@ public class DataFilesTable extends BaseMetadataTable {
     }
   }
 
+  @Override
+  String metadataLocation() {
+    return ops.current().metadataFileLocation();
+  }
+
+  @Override
+  MetadataTableType metadataTableType() {
+    return MetadataTableType.FILES;
+  }
+
   public static class FilesTableScan extends BaseTableScan {
     private final Schema fileSchema;
 
@@ -92,8 +102,8 @@ public class DataFilesTable extends BaseMetadataTable {
     }
 
     @Override
-    protected long targetSplitSize(TableOperations ops) {
-      return ops.current().propertyAsLong(
+    public long targetSplitSize() {
+      return tableOps().current().propertyAsLong(
           TableProperties.METADATA_SPLIT_SIZE, TableProperties.METADATA_SPLIT_SIZE_DEFAULT);
     }
 

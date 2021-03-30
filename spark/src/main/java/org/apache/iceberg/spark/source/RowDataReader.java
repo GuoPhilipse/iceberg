@@ -95,7 +95,11 @@ class RowDataReader extends BaseDataReader<InternalRow> {
     return deletes.filter(open(task, requiredSchema, idToConstant)).iterator();
   }
 
-  private CloseableIterable<InternalRow> open(FileScanTask task, Schema readSchema, Map<Integer, ?> idToConstant) {
+  protected Schema tableSchema() {
+    return tableSchema;
+  }
+
+  protected CloseableIterable<InternalRow> open(FileScanTask task, Schema readSchema, Map<Integer, ?> idToConstant) {
     CloseableIterable<InternalRow> iter;
     if (task.isDataTask()) {
       iter = newDataIterable(task.asDataTask(), readSchema);
@@ -149,6 +153,7 @@ class RowDataReader extends BaseDataReader<InternalRow> {
       Schema readSchema,
       Map<Integer, ?> idToConstant) {
     Parquet.ReadBuilder builder = Parquet.read(location)
+        .reuseContainers()
         .split(task.start(), task.length())
         .project(readSchema)
         .createReaderFunc(fileSchema -> SparkParquetReaders.buildReader(readSchema, fileSchema, idToConstant))
@@ -214,7 +219,7 @@ class RowDataReader extends BaseDataReader<InternalRow> {
         JavaConverters.asScalaBufferConverter(attrs).asScala().toSeq());
   }
 
-  private class SparkDeleteFilter extends DeleteFilter<InternalRow> {
+  protected class SparkDeleteFilter extends DeleteFilter<InternalRow> {
     private final InternalRowWrapper asStructLike;
 
     SparkDeleteFilter(FileScanTask task, Schema tableSchema, Schema requestedSchema) {

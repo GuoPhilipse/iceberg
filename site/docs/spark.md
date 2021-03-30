@@ -17,18 +17,23 @@
 
 # Spark
 
-Iceberg uses Apache Spark's DataSourceV2 API for data source and catalog implementations. Spark DSv2 is an evolving API with different levels of support in Spark versions.
+To use Iceberg in Spark, first configure [Spark catalogs](./spark-configuration.md).
 
-| Feature support                                  | Spark 3.0| Spark 2.4  | Notes                                          |
+Iceberg uses Apache Spark's DataSourceV2 API for data source and catalog implementations. Spark DSv2 is an evolving API with different levels of support in Spark versions:
+
+| SQL feature support                              | Spark 3.0| Spark 2.4  | Notes                                          |
 |--------------------------------------------------|----------|------------|------------------------------------------------|
-| [SQL create table](#create-table)                | ✔️        |            |                                                |
-| [SQL create table as](#create-table-as-select)   | ✔️        |            |                                                |
-| [SQL replace table as](#replace-table-as-select) | ✔️        |            |                                                |
-| [SQL alter table](#alter-table)                  | ✔️        |            |                                                |
-| [SQL drop table](#drop-table)                    | ✔️        |            |                                                |
-| [SQL select](#querying-with-sql)                 | ✔️        |            |                                                |
-| [SQL insert into](#insert-into)                  | ✔️        |            |                                                |
-| [SQL insert overwrite](#insert-overwrite)        | ✔️        |            |                                                |
+| [`CREATE TABLE`](#create-table)                | ✔️        |            |                                                |
+| [`CREATE TABLE AS`](#create-table-as-select)   | ✔️        |            |                                                |
+| [`REPLACE TABLE AS`](#replace-table-as-select) | ✔️        |            |                                                |
+| [`ALTER TABLE`](#alter-table)                  | ✔️        |            | ⚠ Requires [SQL extensions](./spark-configuration.md#sql-extensions) enabled to update partition field and sort order |
+| [`DROP TABLE`](#drop-table)                    | ✔️        |            |                                                |
+| [`SELECT`](#querying-with-sql)                 | ✔️        |            |                                                |
+| [`INSERT INTO`](#insert-into)                  | ✔️        |            |                                                |
+| [`INSERT OVERWRITE`](#insert-overwrite)        | ✔️        |            |                                                |
+
+| DataFrame feature support                        | Spark 3.0| Spark 2.4  | Notes                                          |
+|--------------------------------------------------|----------|------------|------------------------------------------------|
 | [DataFrame reads](#querying-with-dataframes)     | ✔️        | ✔️          |                                                |
 | [DataFrame append](#appending-data)              | ✔️        | ✔️          |                                                |
 | [DataFrame overwrite](#overwriting-data)         | ✔️        | ✔️          | ⚠ Behavior changed in Spark 3.0                |
@@ -37,7 +42,7 @@ Iceberg uses Apache Spark's DataSourceV2 API for data source and catalog impleme
 
 ## Configuring catalogs
 
-Spark 3.0 adds an API to plug in table catalogs that are used to load, create, and manage Iceberg tables. Spark catalogs are configured by setting [Spark properties](../configuration#catalogs) under `spark.sql.catalog`.
+Spark 3.0 adds an API to plug in table catalogs that are used to load, create, and manage Iceberg tables. Spark catalogs are configured by setting [Spark properties](./configuration.md#catalogs) under `spark.sql.catalog`.
 
 This creates an Iceberg catalog named `hive_prod` that loads tables from a Hive metastore:
 
@@ -45,6 +50,7 @@ This creates an Iceberg catalog named `hive_prod` that loads tables from a Hive 
 spark.sql.catalog.hive_prod = org.apache.iceberg.spark.SparkCatalog
 spark.sql.catalog.hive_prod.type = hive
 spark.sql.catalog.hive_prod.uri = thrift://metastore-host:port
+# omit uri to use the same URI as Spark: hive.metastore.uris in hive-site.xml
 ```
 
 Iceberg also supports a directory-based catalog in HDFS that can be configured using `type=hadoop`:
@@ -82,18 +88,27 @@ To add Iceberg table support to Spark's built-in catalog, configure `spark_catal
 ```plain
 spark.sql.catalog.spark_catalog = org.apache.iceberg.spark.SparkSessionCatalog
 spark.sql.catalog.spark_catalog.type = hive
-# omit uri to use the same URI as Spark: hive.metastore.uris in hive-site.xml
 ```
 
 Spark's built-in catalog supports existing v1 and v2 tables tracked in a Hive Metastore. This configures Spark to use Iceberg's `SparkSessionCatalog` as a wrapper around that session catalog. When a table is not an Iceberg table, the built-in catalog will be used to load it instead.
 
 This configuration can use same Hive Metastore for both Iceberg and non-Iceberg tables.
 
+### Loading a custom catalog
+
+Spark supports loading a custom Iceberg `Catalog` implementation by specifying the `catalog-impl` property.
+When `catalog-impl` is set, the value of `type` is ignored. Here is an example:
+
+```plain
+spark.sql.catalog.custom_prod = org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.custom_prod.catalog-impl = com.my.custom.CatalogImpl
+spark.sql.catalog.custom_prod.my-additional-catalog-config = my-value
+```
 
 ## DDL commands
 
 !!! Note
-    Spark 2.4 can't create Iceberg tables with DDL, instead use the [Iceberg API](../java-api-quickstart).
+    Spark 2.4 can't create Iceberg tables with DDL, instead use the [Iceberg API](./java-api-quickstart.md).
 
 ### `CREATE TABLE`
 
@@ -106,12 +121,14 @@ CREATE TABLE prod.db.sample (
 USING iceberg
 ```
 
+Iceberg will convert the column type in Spark to corresponding Iceberg type. Please check the section of [type compatibility on creating table](#spark-type-to-iceberg-type) for details.
+
 Table create commands, including CTAS and RTAS, support the full range of Spark create clauses, including:
 
 * `PARTITION BY (partition-expressions)` to configure partitioning
 * `LOCATION '(fully-qualified-uri)'` to set the table location
 * `COMMENT 'table documentation'` to set a table description
-* `TBLPROPERTIES ('key'='value', ...)` to set [table configuration](../configuration)
+* `TBLPROPERTIES ('key'='value', ...)` to set [table configuration](./configuration.md)
 
 Create commands may also set the default format with the `USING` clause. This is only supported for `SparkCatalog` because Spark handles the `USING` clause differently for the built-in catalog.
 
@@ -128,7 +145,7 @@ USING iceberg
 PARTITIONED BY (category)
 ```
 
-The `PARTITIONED BY` clause supports transform expressions to create [hidden partitions](../partitioning).
+The `PARTITIONED BY` clause supports transform expressions to create [hidden partitions](./partitioning.md).
 
 ```sql
 CREATE TABLE prod.db.sample (
@@ -177,7 +194,7 @@ AS SELECT ...
 ```
 
 The schema and partition spec will be replaced if changed. To avoid modifying the table's schema and partitioning, use `INSERT OVERWRITE` instead of `REPLACE TABLE`.
-
+The new table properties in the `REPLACE TABLE` command will be merged with any existing table properties. The existing table properties will be updated if changed else they are preserved.
 ### `ALTER TABLE`
 
 Iceberg has full `ALTER TABLE` support in Spark 3, including:
@@ -204,7 +221,7 @@ ALTER TABLE prod.db.sample SET TBLPROPERTIES (
 )
 ```
 
-Iceberg uses table properties to control table behavior. For a list of available properties, see [Table configuration](../configuration).
+Iceberg uses table properties to control table behavior. For a list of available properties, see [Table configuration](./configuration.md).
 
 `UNSET` is used to remove properties:
 
@@ -244,6 +261,47 @@ ALTER TABLE prod.db.sample ALTER COLUMN id COMMENT 'unique id'
 ```sql
 ALTER TABLE prod.db.sample DROP COLUMN id
 ALTER TABLE prod.db.sample DROP COLUMN point.z
+```
+
+### `ALTER TABLE ... ADD PARTITION FIELD`
+
+```sql
+ALTER TABLE prod.db.sample ADD PARTITION FIELD catalog -- identity transform
+ALTER TABLE prod.db.sample ADD PARTITION FIELD bucket(16, id)
+ALTER TABLE prod.db.sample ADD PARTITION FIELD truncate(data, 4)
+ALTER TABLE prod.db.sample ADD PARTITION FIELD years(ts)
+-- use optional AS keyword to specify a custom name for the partition field 
+ALTER TABLE prod.db.sample ADD PARTITION FIELD bucket(16, id) AS shard
+```
+
+!!! Warning
+    Changing partitioning will change the behavior of dynamic writes, which overwrite any partition that is written to. 
+    For example, if you partition by days and move to partitioning by hours, overwrites will overwrite hourly partitions but not days anymore.
+
+
+### `ALTER TABLE ... DROP PARTITION FIELD`
+
+```sql
+ALTER TABLE prod.db.sample DROP PARTITION FIELD catalog
+ALTER TABLE prod.db.sample DROP PARTITION FIELD bucket(16, id)
+ALTER TABLE prod.db.sample DROP PARTITION FIELD truncate(data, 4)
+ALTER TABLE prod.db.sample DROP PARTITION FIELD years(ts)
+ALTER TABLE prod.db.sample DROP PARTITION FIELD shard
+```
+
+!!! Warning
+    Changing partitioning will change the behavior of dynamic writes, which overwrite any partition that is written to. 
+    For example, if you partition by days and move to partitioning by hours, overwrites will overwrite hourly partitions but not days anymore.
+
+
+### `ALTER TABLE ... WRITE ORDERED BY`
+
+```sql
+ALTER TABLE prod.db.sample WRITE ORDERED BY category, id
+-- use optional ASC/DEC keyword to specify sort order of each field (default ASC)
+ALTER TABLE prod.db.sample WRITE ORDERED BY category ASC, id DESC
+-- use optional NULLS FIRST/NULLS LAST keyword to specify null order of each field (default FIRST)
+ALTER TABLE prod.db.sample WRITE ORDERED BY category ASC NULLS LAST, id DESC NULLS FIRST
 ```
 
 ### `DROP TABLE`
@@ -313,6 +371,21 @@ spark.read
 
 Time travel is not yet supported by Spark's SQL syntax.
 
+### Table names and paths
+
+Paths and table names can be loaded from the Spark3 dataframe interface. How paths/tables are loaded depends on how
+the identifier is specified. When using `spark.read().format("iceberg").path(table)` or `spark.table(table)` the `table`
+variable can take a number of forms as listed below:
+
+*  `file:/path/to/table` -> loads a HadoopTable at given path
+*  `tablename` -> loads `currentCatalog.currentNamespace.tablename`
+*  `catalog.tablename` -> load `tablename` from the specified catalog.
+*  `namespace.tablename` -> load `namespace.tablename` from current catalog
+*  `catalog.namespace.tablename` -> load `namespace.tablename` from the specified catalog.
+*  `namespace1.namespace2.tablename` -> load `namespace1.namespace2.tablename` from current catalog
+
+The above list is in order of priority. For example: a matching catalog will take priority over any namespace resolution.
+
 ### Spark 2.4
 
 Spark 2.4 requires using the DataFrame reader with `iceberg` as a format, because 2.4 does not support catalogs:
@@ -359,7 +432,7 @@ The partitions that will be replaced by `INSERT OVERWRITE` depends on Spark's pa
 
 !!! Warning
     Spark 3.0.0 has a correctness bug that affects dynamic `INSERT OVERWRITE` with hidden partitioning, [SPARK-32168][spark-32168].
-    For tables with [hidden partitions](../partitioning), wait for Spark 3.0.1.
+    For tables with [hidden partitions](./partitioning.md), wait for Spark 3.0.1.
 
 [spark-32168]: https://issues.apache.org/jira/browse/SPARK-32168
 
@@ -728,3 +801,4 @@ spark.read.format("iceberg").load("db.table.files").show(truncate = false)
 // Hadoop path table
 spark.read.format("iceberg").load("hdfs://nn:8020/path/to/table#files").show(truncate = false)
 ```
+

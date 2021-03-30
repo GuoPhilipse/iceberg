@@ -20,20 +20,26 @@
 package org.apache.iceberg;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.events.CreateSnapshotEvent;
 import org.apache.iceberg.exceptions.RuntimeIOException;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.base.Predicate;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
+import org.apache.iceberg.relocated.com.google.common.collect.Iterators;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 
 import static org.apache.iceberg.TableProperties.MANIFEST_MIN_MERGE_COUNT;
 import static org.apache.iceberg.TableProperties.MANIFEST_MIN_MERGE_COUNT_DEFAULT;
@@ -43,9 +49,17 @@ import static org.apache.iceberg.TableProperties.SNAPSHOT_ID_INHERITANCE_ENABLED
 import static org.apache.iceberg.TableProperties.SNAPSHOT_ID_INHERITANCE_ENABLED_DEFAULT;
 
 abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
+  // data is only added in "append" and "overwrite" operations
+  private static final Set<String> VALIDATE_ADDED_FILES_OPERATIONS =
+      ImmutableSet.of(DataOperations.APPEND, DataOperations.OVERWRITE);
+  // data files are removed in "overwrite", "replace", and "delete"
+  private static final Set<String> VALIDATE_DATA_FILES_EXIST_OPERATIONS =
+      ImmutableSet.of(DataOperations.OVERWRITE, DataOperations.REPLACE, DataOperations.DELETE);
+  private static final Set<String> VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS =
+      ImmutableSet.of(DataOperations.OVERWRITE, DataOperations.REPLACE);
+
   private final String tableName;
   private final TableOperations ops;
-  private final PartitionSpec spec;
   private final SnapshotSummary.Builder summaryBuilder = SnapshotSummary.builder();
   private final ManifestMergeManager<DataFile> mergeManager;
   private final ManifestFilterManager<DataFile> filterManager;
@@ -61,6 +75,7 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
   private final SnapshotSummary.Builder addedFilesSummary = SnapshotSummary.builder();
   private final SnapshotSummary.Builder appendedManifestsSummary = SnapshotSummary.builder();
   private Expression deleteExpression = Expressions.alwaysFalse();
+  private PartitionSpec spec;
 
   // cache new manifests after writing
   private ManifestFile cachedNewManifest = null;
@@ -72,7 +87,7 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
     super(ops);
     this.tableName = tableName;
     this.ops = ops;
-    this.spec = ops.current().spec();
+    this.spec = null;
     long targetSizeBytes = ops.current()
         .propertyAsLong(MANIFEST_TARGET_SIZE_BYTES, MANIFEST_TARGET_SIZE_BYTES_DEFAULT);
     int minCountToMerge = ops.current()
@@ -94,6 +109,8 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
   }
 
   protected PartitionSpec writeSpec() {
+    Preconditions.checkState(spec != null,
+        "Cannot determine partition spec: no data or delete files have been added");
     // the spec is set when the write is started
     return spec;
   }
@@ -164,7 +181,8 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
    * Add a data file to the new snapshot.
    */
   protected void add(DataFile file) {
-    addedFilesSummary.addedFile(spec, file);
+    setWriteSpec(file);
+    addedFilesSummary.addedFile(writeSpec(), file);
     hasNewFiles = true;
     newFiles.add(file);
   }
@@ -173,9 +191,22 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
    * Add a delete file to the new snapshot.
    */
   protected void add(DeleteFile file) {
-    addedFilesSummary.addedFile(spec, file);
+    setWriteSpec(file);
+    addedFilesSummary.addedFile(writeSpec(), file);
     hasNewDeleteFiles = true;
     newDeleteFiles.add(file);
+  }
+
+  private void setWriteSpec(ContentFile<?> file) {
+    Preconditions.checkNotNull(file, "Invalid content file: null");
+    PartitionSpec writeSpec = ops.current().spec(file.specId());
+    Preconditions.checkNotNull(writeSpec,
+        "Cannot find partition spec for file: %s", file.path());
+    if (spec == null) {
+      spec = writeSpec;
+    } else if (spec.specId() != file.specId()) {
+      throw new ValidationException("Invalid file, expected spec id: %d", spec.specId());
+    }
   }
 
   /**
@@ -202,8 +233,120 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
         current.formatVersion(), toCopy, current.specsById(), newManifestPath, snapshotId(), appendedManifestsSummary);
   }
 
+  /**
+   * Validates that no files matching a filter have been added to the table since a starting snapshot.
+   *
+   * @param base table metadata to validate
+   * @param startingSnapshotId id of the snapshot current at the start of the operation
+   * @param conflictDetectionFilter an expression used to find new conflicting data files
+   * @param caseSensitive whether expression evaluation should be case sensitive
+   */
+  protected void validateAddedDataFiles(TableMetadata base, Long startingSnapshotId,
+                                        Expression conflictDetectionFilter, boolean caseSensitive) {
+    // if there is no current table state, no files have been added
+    if (base.currentSnapshot() == null) {
+      return;
+    }
+
+    List<ManifestFile> manifests = Lists.newArrayList();
+    Set<Long> newSnapshots = Sets.newHashSet();
+
+    Long currentSnapshotId = base.currentSnapshot().snapshotId();
+    while (currentSnapshotId != null && !currentSnapshotId.equals(startingSnapshotId)) {
+      Snapshot currentSnapshot = ops.current().snapshot(currentSnapshotId);
+
+      ValidationException.check(currentSnapshot != null,
+          "Cannot determine history between starting snapshot %s and current %s",
+          startingSnapshotId, currentSnapshotId);
+
+      if (VALIDATE_ADDED_FILES_OPERATIONS.contains(currentSnapshot.operation())) {
+        newSnapshots.add(currentSnapshotId);
+        for (ManifestFile manifest : currentSnapshot.dataManifests()) {
+          if (manifest.snapshotId() == (long) currentSnapshotId) {
+            manifests.add(manifest);
+          }
+        }
+      }
+
+      currentSnapshotId = currentSnapshot.parentId();
+    }
+
+    ManifestGroup conflictGroup = new ManifestGroup(ops.io(), manifests, ImmutableList.of())
+        .caseSensitive(caseSensitive)
+        .filterManifestEntries(entry -> newSnapshots.contains(entry.snapshotId()))
+        .filterData(conflictDetectionFilter)
+        .specsById(base.specsById())
+        .ignoreDeleted()
+        .ignoreExisting();
+
+    try (CloseableIterator<ManifestEntry<DataFile>> conflicts = conflictGroup.entries().iterator()) {
+      if (conflicts.hasNext()) {
+        throw new ValidationException("Found conflicting files that can contain records matching %s: %s",
+            conflictDetectionFilter,
+            Iterators.toString(Iterators.transform(conflicts, entry -> entry.file().path().toString())));
+      }
+
+    } catch (IOException e) {
+      throw new UncheckedIOException(
+          String.format("Failed to validate no appends matching %s", conflictDetectionFilter), e);
+    }
+  }
+
+  protected void validateDataFilesExist(TableMetadata base, Long startingSnapshotId,
+                                        Set<CharSequence> requiredDataFiles, boolean skipDeletes) {
+    // if there is no current table state, no files have been removed
+    if (base.currentSnapshot() == null) {
+      return;
+    }
+
+    Set<String> matchingOperations = skipDeletes ?
+        VALIDATE_DATA_FILES_EXIST_SKIP_DELETE_OPERATIONS :
+        VALIDATE_DATA_FILES_EXIST_OPERATIONS;
+
+    List<ManifestFile> manifests = Lists.newArrayList();
+    Set<Long> newSnapshots = Sets.newHashSet();
+
+    Long currentSnapshotId = base.currentSnapshot().snapshotId();
+    while (currentSnapshotId != null && !currentSnapshotId.equals(startingSnapshotId)) {
+      Snapshot currentSnapshot = ops.current().snapshot(currentSnapshotId);
+
+      ValidationException.check(currentSnapshot != null,
+          "Cannot determine history between starting snapshot %s and current %s",
+          startingSnapshotId, currentSnapshotId);
+
+      if (matchingOperations.contains(currentSnapshot.operation())) {
+        newSnapshots.add(currentSnapshotId);
+        for (ManifestFile manifest : currentSnapshot.dataManifests()) {
+          if (manifest.snapshotId() == (long) currentSnapshotId) {
+            manifests.add(manifest);
+          }
+        }
+      }
+
+      currentSnapshotId = currentSnapshot.parentId();
+    }
+
+    ManifestGroup matchingDeletesGroup = new ManifestGroup(ops.io(), manifests, ImmutableList.of())
+        .filterManifestEntries(entry -> entry.status() != ManifestEntry.Status.ADDED &&
+            newSnapshots.contains(entry.snapshotId()) && requiredDataFiles.contains(entry.file().path()))
+        .specsById(base.specsById())
+        .ignoreExisting();
+
+    try (CloseableIterator<ManifestEntry<DataFile>> deletes = matchingDeletesGroup.entries().iterator()) {
+      if (deletes.hasNext()) {
+        throw new ValidationException("Cannot commit, missing data files: %s",
+            Iterators.toString(Iterators.transform(deletes, entry -> entry.file().path().toString())));
+      }
+
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to validate required files exist", e);
+    }
+  }
+
   @Override
   protected Map<String, String> summary() {
+    summaryBuilder.setPartitionSummaryLimit(ops.current().propertyAsInt(
+        TableProperties.WRITE_PARTITION_SUMMARY_LIMIT, TableProperties.WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT));
     return summaryBuilder.build();
   }
 
@@ -317,7 +460,7 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
 
     if (cachedNewManifest == null) {
       try {
-        ManifestWriter<DataFile> writer = newManifestWriter(spec);
+        ManifestWriter<DataFile> writer = newManifestWriter(writeSpec());
         try {
           writer.addAll(newFiles);
         } finally {
@@ -350,7 +493,7 @@ abstract class MergingSnapshotProducer<ThisT> extends SnapshotProducer<ThisT> {
 
     if (cachedNewDeleteManifest == null) {
       try {
-        ManifestWriter<DeleteFile> writer = newDeleteManifestWriter(spec);
+        ManifestWriter<DeleteFile> writer = newDeleteManifestWriter(writeSpec());
         try {
           writer.addAll(newDeleteFiles);
         } finally {

@@ -19,6 +19,7 @@
 
 package org.apache.iceberg;
 
+import java.util.Map;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.ResidualEvaluator;
@@ -76,6 +77,16 @@ public class ManifestEntriesTable extends BaseMetadataTable {
     }
   }
 
+  @Override
+  String metadataLocation() {
+    return ops.current().metadataFileLocation();
+  }
+
+  @Override
+  MetadataTableType metadataTableType() {
+    return MetadataTableType.ENTRIES;
+  }
+
   private static class EntriesTableScan extends BaseTableScan {
 
     EntriesTableScan(TableOperations ops, Table table, Schema schema) {
@@ -93,8 +104,8 @@ public class ManifestEntriesTable extends BaseMetadataTable {
     }
 
     @Override
-    protected long targetSplitSize(TableOperations ops) {
-      return ops.current().propertyAsLong(
+    public long targetSplitSize() {
+      return tableOps().current().propertyAsLong(
           TableProperties.METADATA_SPLIT_SIZE, TableProperties.METADATA_SPLIT_SIZE_DEFAULT);
     }
 
@@ -112,7 +123,8 @@ public class ManifestEntriesTable extends BaseMetadataTable {
       ResidualEvaluator residuals = ResidualEvaluator.unpartitioned(filter);
 
       return CloseableIterable.transform(manifests, manifest ->
-          new ManifestReadTask(ops.io(), manifest, fileSchema, schemaString, specString, residuals));
+          new ManifestReadTask(ops.io(), manifest, fileSchema, schemaString, specString, residuals,
+              ops.current().specsById()));
     }
   }
 
@@ -120,20 +132,27 @@ public class ManifestEntriesTable extends BaseMetadataTable {
     private final Schema fileSchema;
     private final FileIO io;
     private final ManifestFile manifest;
+    private final Map<Integer, PartitionSpec> specsById;
 
     ManifestReadTask(FileIO io, ManifestFile manifest, Schema fileSchema, String schemaString,
-                     String specString, ResidualEvaluator residuals) {
+                     String specString, ResidualEvaluator residuals, Map<Integer, PartitionSpec> specsById) {
       super(DataFiles.fromManifest(manifest), null, schemaString, specString, residuals);
       this.fileSchema = fileSchema;
       this.io = io;
       this.manifest = manifest;
+      this.specsById = specsById;
     }
 
     @Override
     public CloseableIterable<StructLike> rows() {
-      return CloseableIterable.transform(
-          ManifestFiles.read(manifest, io).project(fileSchema).entries(),
-          file -> (GenericManifestEntry<?>) file);
+      if (manifest.content() == ManifestContent.DATA) {
+        return CloseableIterable.transform(ManifestFiles.read(manifest, io).project(fileSchema).entries(),
+            file -> (GenericManifestEntry<DataFile>) file);
+      } else {
+        return CloseableIterable.transform(ManifestFiles.readDeleteManifest(manifest, io, specsById)
+                .project(fileSchema).entries(),
+            file -> (GenericManifestEntry<DeleteFile>) file);
+      }
     }
 
     @Override

@@ -66,7 +66,6 @@ import static org.apache.iceberg.spark.SparkSchemaUtil.convert;
 import static scala.collection.JavaConverters.mapAsJavaMapConverter;
 import static scala.collection.JavaConverters.seqAsJavaListConverter;
 
-@SuppressWarnings("checkstyle:OverloadMethodsDeclarationOrder")
 public class TestHelpers {
 
   private TestHelpers() {
@@ -99,7 +98,7 @@ public class TestHelpers {
         if (checkArrowValidityVector) {
           ColumnVector columnVector = batch.column(i);
           ValueVector arrowVector = ((IcebergArrowColumnVector) columnVector).vectorAccessor().getVector();
-          Assert.assertEquals("Nullability doesn't match", expectedValue == null, arrowVector.isNull(rowId));
+          Assert.assertFalse("Nullability doesn't match", expectedValue == null ^ arrowVector.isNull(rowId));
         }
       }
     }
@@ -268,11 +267,26 @@ public class TestHelpers {
     }
 
     switch (type.typeId()) {
-      case BOOLEAN:
-      case INTEGER:
       case LONG:
-      case FLOAT:
+        Assert.assertTrue("Should be a long", actual instanceof Long);
+        if (expected instanceof Integer) {
+          Assert.assertEquals("Values didn't match", ((Number) expected).longValue(), actual);
+        } else {
+          Assert.assertEquals("Primitive value should be equal to expected", expected, actual);
+        }
+        break;
       case DOUBLE:
+        Assert.assertTrue("Should be a double", actual instanceof Double);
+        if (expected instanceof Float) {
+          Assert.assertEquals("Values didn't match", Double.doubleToLongBits(((Number) expected).doubleValue()),
+                  Double.doubleToLongBits((double) actual));
+        } else {
+          Assert.assertEquals("Primitive value should be equal to expected", expected, actual);
+        }
+        break;
+      case INTEGER:
+      case FLOAT:
+      case BOOLEAN:
       case DATE:
       case TIMESTAMP:
         Assert.assertEquals("Primitive value should be equal to expected", expected, actual);

@@ -32,7 +32,7 @@ import org.apache.iceberg.hadoop.SerializableConfiguration;
 import org.apache.iceberg.hadoop.Util;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.mr.InputFormatConfig;
-import org.apache.iceberg.mr.SerializationUtil;
+import org.apache.iceberg.util.SerializationUtil;
 
 // Since this class extends `mapreduce.InputSplit and implements `mapred.InputSplit`, it can be returned by both MR v1
 // and v2 file formats.
@@ -74,9 +74,13 @@ public class IcebergSplit extends InputSplit implements org.apache.hadoop.mapred
 
   @Override
   public String[] getLocations() {
-    if (locations == null) {
+    // The implementation of getLocations() is only meant to be used during split computation
+    // getLocations() won't be accurate when called on worker nodes and will always return "*"
+    if (locations == null && conf != null) {
       boolean localityPreferred = conf.getBoolean(InputFormatConfig.LOCALITY, false);
       locations = localityPreferred ? Util.blockLocations(task, conf) : ANYWHERE;
+    } else {
+      locations = ANYWHERE;
     }
 
     return locations;

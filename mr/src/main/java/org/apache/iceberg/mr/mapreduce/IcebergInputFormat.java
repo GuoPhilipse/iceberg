@@ -25,6 +25,7 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiFunction;
 import org.apache.hadoop.conf.Configuration;
@@ -46,7 +47,10 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.avro.Avro;
+import org.apache.iceberg.data.DeleteFilter;
+import org.apache.iceberg.data.GenericDeleteFilter;
 import org.apache.iceberg.data.IdentityPartitionConverters;
+import org.apache.iceberg.data.InternalRecordWrapper;
 import org.apache.iceberg.data.avro.DataReader;
 import org.apache.iceberg.data.orc.GenericOrcReader;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
@@ -61,7 +65,7 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mr.Catalogs;
 import org.apache.iceberg.mr.InputFormatConfig;
-import org.apache.iceberg.mr.SerializationUtil;
+import org.apache.iceberg.mr.hive.HiveIcebergStorageHandler;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -69,8 +73,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.util.PartitionUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.iceberg.util.SerializationUtil;
 
 /**
  * Generic Mrv2 InputFormat API for Iceberg.
@@ -78,8 +81,6 @@ import org.slf4j.LoggerFactory;
  * @param <T> T is the in memory data model which can either be Pig tuples, Hive rows. Default is Iceberg records
  */
 public class IcebergInputFormat<T> extends InputFormat<Void, T> {
-  private static final Logger LOG = LoggerFactory.getLogger(IcebergInputFormat.class);
-
   /**
    * Configures the {@code Job} to use the {@code IcebergInputFormat} and
    * returns a helper to add further configuration.
@@ -94,9 +95,12 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
   @Override
   public List<InputSplit> getSplits(JobContext context) {
     Configuration conf = context.getConfiguration();
-    Table table = Catalogs.loadTable(conf);
+    Table table = Optional
+        .ofNullable(HiveIcebergStorageHandler.table(conf, conf.get(InputFormatConfig.TABLE_IDENTIFIER)))
+        .orElseGet(() -> Catalogs.loadTable(conf));
+
     TableScan scan = table.newScan()
-            .caseSensitive(conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, true));
+            .caseSensitive(conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, InputFormatConfig.CASE_SENSITIVE_DEFAULT));
     long snapshotId = conf.getLong(InputFormatConfig.SNAPSHOT_ID, -1);
     if (snapshotId != -1) {
       scan = scan.useSnapshot(snapshotId);
@@ -112,6 +116,10 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
     String schemaStr = conf.get(InputFormatConfig.READ_SCHEMA);
     if (schemaStr != null) {
       scan.project(SchemaParser.fromJson(schemaStr));
+    }
+    String[] selectedColumns = conf.getStrings(InputFormatConfig.SELECTED_COLUMNS);
+    if (selectedColumns != null) {
+      scan.select(selectedColumns);
     }
 
     // TODO add a filter parser to get rid of Serialization
@@ -179,11 +187,10 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
       this.io = ((IcebergSplit) split).io();
       this.encryptionManager = ((IcebergSplit) split).encryptionManager();
       this.tasks = task.files().iterator();
-      this.tableSchema = SchemaParser.fromJson(conf.get(InputFormatConfig.TABLE_SCHEMA));
-      String readSchemaStr = conf.get(InputFormatConfig.READ_SCHEMA);
-      this.expectedSchema = readSchemaStr != null ? SchemaParser.fromJson(readSchemaStr) : tableSchema;
+      this.tableSchema = InputFormatConfig.tableSchema(conf);
+      this.caseSensitive = conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, InputFormatConfig.CASE_SENSITIVE_DEFAULT);
+      this.expectedSchema = readSchema(conf, tableSchema, caseSensitive);
       this.reuseContainers = conf.getBoolean(InputFormatConfig.REUSE_CONTAINERS, false);
-      this.caseSensitive = conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, true);
       this.inMemoryDataModel = conf.getEnum(InputFormatConfig.IN_MEMORY_DATA_MODEL,
               InputFormatConfig.InMemoryDataModel.GENERIC);
       this.currentIterator = open(tasks.next(), expectedSchema).iterator();
@@ -231,7 +238,7 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
       currentIterator.close();
     }
 
-    private CloseableIterable<T> open(FileScanTask currentTask, Schema readSchema) {
+    private CloseableIterable<T> openTask(FileScanTask currentTask, Schema readSchema) {
       DataFile file = currentTask.file();
       InputFile inputFile = encryptionManager.decrypt(EncryptedFiles.encryptedInput(
           io.newInputFile(file.path().toString()),
@@ -256,13 +263,32 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
       return iterable;
     }
 
+    @SuppressWarnings("unchecked")
+    private CloseableIterable<T> open(FileScanTask currentTask, Schema readSchema) {
+      switch (inMemoryDataModel) {
+        case PIG:
+        case HIVE:
+          // TODO: Support Pig and Hive object models for IcebergInputFormat
+          throw new UnsupportedOperationException("Pig and Hive object models are not supported.");
+        case GENERIC:
+          DeleteFilter deletes = new GenericDeleteFilter(io, currentTask, tableSchema, readSchema);
+          Schema requiredSchema = deletes.requiredSchema();
+          return deletes.filter(openTask(currentTask, requiredSchema));
+        default:
+          throw new UnsupportedOperationException("Unsupported memory model");
+      }
+    }
+
     private CloseableIterable<T> applyResidualFiltering(CloseableIterable<T> iter, Expression residual,
                                                         Schema readSchema) {
       boolean applyResidual = !context.getConfiguration().getBoolean(InputFormatConfig.SKIP_RESIDUAL_FILTERING, false);
 
       if (applyResidual && residual != null && residual != Expressions.alwaysTrue()) {
+        // Date and timestamp values are not the correct type for Evaluator.
+        // Wrapping to return the expected type.
+        InternalRecordWrapper wrapper = new InternalRecordWrapper(readSchema.asStruct());
         Evaluator filter = new Evaluator(readSchema.asStruct(), residual, caseSensitive);
-        return CloseableIterable.filter(iter, record -> filter.eval((StructLike) record));
+        return CloseableIterable.filter(iter, record -> filter.eval(wrapper.wrap((StructLike) record)));
       } else {
         return iter;
       }
@@ -348,6 +374,21 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
       } else {
         return Collections.emptyMap();
       }
+    }
+
+    private static Schema readSchema(Configuration conf, Schema tableSchema, boolean caseSensitive) {
+      Schema readSchema = InputFormatConfig.readSchema(conf);
+
+      if (readSchema != null) {
+        return readSchema;
+      }
+
+      String[] selectedColumns = InputFormatConfig.selectedColumns(conf);
+      if (selectedColumns == null) {
+        return tableSchema;
+      }
+
+      return caseSensitive ? tableSchema.select(selectedColumns) : tableSchema.caseInsensitiveSelect(selectedColumns);
     }
   }
 

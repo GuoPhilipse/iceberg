@@ -30,6 +30,11 @@ import java.util.Map;
  */
 public interface ContentFile<F> {
   /**
+   * Returns the ordinal position of the file in a manifest, or null if it was not read from a manifest.
+   */
+  Long pos();
+
+  /**
    * Returns id of the partition spec used for partition metadata.
    */
   int specId();
@@ -80,6 +85,11 @@ public interface ContentFile<F> {
   Map<Integer, Long> nullValueCounts();
 
   /**
+   * Returns if collected, map from column ID to its NaN value count, null otherwise.
+   */
+  Map<Integer, Long> nanValueCounts();
+
+  /**
    * Returns if collected, map from column ID to value lower bounds, null otherwise.
    */
   Map<Integer, ByteBuffer> lowerBounds();
@@ -114,6 +124,14 @@ public interface ContentFile<F> {
    */
   List<Integer> equalityFieldIds();
 
+  /**
+   * Returns the sort order id of this file, which describes how the file is ordered.
+   * This information will be useful for merging data and equality delete files more efficiently
+   * when they share the same sort order id.
+   */
+  default Integer sortOrderId() {
+    return null;
+  }
 
   /**
    * Copies this file. Manifest readers can reuse file instances; use
@@ -127,7 +145,9 @@ public interface ContentFile<F> {
    * Copies this file without file stats. Manifest readers can reuse file instances; use
    * this method to copy data without stats when collecting files.
    *
-   * @return a copy of this data file, without lower bounds, upper bounds, value counts, or null value counts
+   * @return a copy of this data file, without lower bounds, upper bounds, value counts,
+   *         null value counts, or nan value counts
    */
   F copyWithoutStats();
+
 }

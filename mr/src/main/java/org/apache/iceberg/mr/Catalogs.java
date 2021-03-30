@@ -25,6 +25,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.PartitionSpecParser;
 import org.apache.iceberg.Schema;
@@ -36,9 +37,10 @@ import org.apache.iceberg.common.DynConstructors;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.hadoop.HadoopCatalog;
 import org.apache.iceberg.hadoop.HadoopTables;
-import org.apache.iceberg.hive.HiveCatalogs;
+import org.apache.iceberg.hive.HiveCatalog;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,8 +61,8 @@ public final class Catalogs {
   private static final String HADOOP = "hadoop";
   private static final String HIVE = "hive";
 
-  private static final String NAME = "name";
-  private static final String LOCATION = "location";
+  public static final String NAME = "name";
+  public static final String LOCATION = "location";
 
   private static final Set<String> PROPERTIES_TO_REMOVE =
       ImmutableSet.of(InputFormatConfig.TABLE_SCHEMA, InputFormatConfig.PARTITION_SPEC, LOCATION, NAME);
@@ -177,6 +179,15 @@ public final class Catalogs {
     return new HadoopTables(conf).dropTable(location);
   }
 
+  /**
+   * Returns true if HiveCatalog is used
+   * @param conf a Hadoop conf
+   * @return true if the Catalog is HiveCatalog
+   */
+  public static boolean hiveCatalog(Configuration conf) {
+    return HIVE.equalsIgnoreCase(conf.get(InputFormatConfig.CATALOG));
+  }
+
   @VisibleForTesting
   static Optional<Catalog> loadCatalog(Configuration conf) {
     String catalogLoaderClass = conf.get(InputFormatConfig.CATALOG_LOADER_CLASS);
@@ -203,7 +214,8 @@ public final class Catalogs {
           LOG.info("Loaded Hadoop catalog {}", catalog);
           return Optional.of(catalog);
         case HIVE:
-          catalog = HiveCatalogs.loadCatalog(conf);
+          catalog = CatalogUtil.loadCatalog(HiveCatalog.class.getName(), CatalogUtil.ICEBERG_CATALOG_TYPE_HIVE,
+                  ImmutableMap.of(), conf);
           LOG.info("Loaded Hive Metastore catalog {}", catalog);
           return Optional.of(catalog);
         default:

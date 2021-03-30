@@ -31,6 +31,7 @@ import org.apache.avro.generic.IndexedRecord;
 import org.apache.avro.specific.SpecificData;
 import org.apache.iceberg.avro.AvroSchemaUtil;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
@@ -53,6 +54,7 @@ abstract class BaseFile<F>
   private int[] fromProjectionPos;
   private Types.StructType partitionType;
 
+  private Long fileOrdinal = null;
   private int partitionSpecId = -1;
   private FileContent content = FileContent.DATA;
   private String filePath = null;
@@ -65,11 +67,13 @@ abstract class BaseFile<F>
   private Map<Integer, Long> columnSizes = null;
   private Map<Integer, Long> valueCounts = null;
   private Map<Integer, Long> nullValueCounts = null;
+  private Map<Integer, Long> nanValueCounts = null;
   private Map<Integer, ByteBuffer> lowerBounds = null;
   private Map<Integer, ByteBuffer> upperBounds = null;
   private long[] splitOffsets = null;
   private int[] equalityIds = null;
   private byte[] keyMetadata = null;
+  private Integer sortOrderId;
 
   // cached schema
   private transient Schema avroSchema = null;
@@ -91,7 +95,10 @@ abstract class BaseFile<F>
     }
 
     List<Types.NestedField> fields = schema.fields();
-    List<Types.NestedField> allFields = DataFile.getType(partitionType).fields();
+    List<Types.NestedField> allFields = Lists.newArrayList();
+    allFields.addAll(DataFile.getType(partitionType).fields());
+    allFields.add(MetadataColumns.ROW_POSITION);
+
     this.fromProjectionPos = new int[fields.size()];
     for (int i = 0; i < fromProjectionPos.length; i += 1) {
       boolean found = false;
@@ -112,9 +119,10 @@ abstract class BaseFile<F>
 
   BaseFile(int specId, FileContent content, String filePath, FileFormat format,
            PartitionData partition, long fileSizeInBytes, long recordCount,
-           Map<Integer, Long> columnSizes, Map<Integer, Long> valueCounts, Map<Integer, Long> nullValueCounts,
+           Map<Integer, Long> columnSizes, Map<Integer, Long> valueCounts,
+           Map<Integer, Long> nullValueCounts, Map<Integer, Long> nanValueCounts,
            Map<Integer, ByteBuffer> lowerBounds, Map<Integer, ByteBuffer> upperBounds, List<Long> splitOffsets,
-           int[] equalityFieldIds, ByteBuffer keyMetadata) {
+           int[] equalityFieldIds, Integer sortOrderId, ByteBuffer keyMetadata) {
     this.partitionSpecId = specId;
     this.content = content;
     this.filePath = filePath;
@@ -135,10 +143,12 @@ abstract class BaseFile<F>
     this.columnSizes = columnSizes;
     this.valueCounts = valueCounts;
     this.nullValueCounts = nullValueCounts;
+    this.nanValueCounts = nanValueCounts;
     this.lowerBounds = SerializableByteBufferMap.wrap(lowerBounds);
     this.upperBounds = SerializableByteBufferMap.wrap(upperBounds);
     this.splitOffsets = ArrayUtil.toLongArray(splitOffsets);
     this.equalityIds = equalityFieldIds;
+    this.sortOrderId = sortOrderId;
     this.keyMetadata = ByteBuffers.toByteArray(keyMetadata);
   }
 
@@ -149,6 +159,7 @@ abstract class BaseFile<F>
    * @param fullCopy whether to copy all fields or to drop column-level stats
    */
   BaseFile(BaseFile<F> toCopy, boolean fullCopy) {
+    this.fileOrdinal = toCopy.fileOrdinal;
     this.partitionSpecId = toCopy.partitionSpecId;
     this.content = toCopy.content;
     this.filePath = toCopy.filePath;
@@ -162,12 +173,14 @@ abstract class BaseFile<F>
       this.columnSizes = copy(toCopy.columnSizes);
       this.valueCounts = copy(toCopy.valueCounts);
       this.nullValueCounts = copy(toCopy.nullValueCounts);
+      this.nanValueCounts = copy(toCopy.nanValueCounts);
       this.lowerBounds = SerializableByteBufferMap.wrap(copy(toCopy.lowerBounds));
       this.upperBounds = SerializableByteBufferMap.wrap(copy(toCopy.upperBounds));
     } else {
       this.columnSizes = null;
       this.valueCounts = null;
       this.nullValueCounts = null;
+      this.nanValueCounts = null;
       this.lowerBounds = null;
       this.upperBounds = null;
     }
@@ -176,6 +189,7 @@ abstract class BaseFile<F>
     this.splitOffsets = toCopy.splitOffsets == null ? null :
         Arrays.copyOf(toCopy.splitOffsets, toCopy.splitOffsets.length);
     this.equalityIds = toCopy.equalityIds != null ? Arrays.copyOf(toCopy.equalityIds, toCopy.equalityIds.length) : null;
+    this.sortOrderId = toCopy.sortOrderId;
   }
 
   /**
@@ -241,19 +255,28 @@ abstract class BaseFile<F>
         this.nullValueCounts = (Map<Integer, Long>) value;
         return;
       case 9:
-        this.lowerBounds = SerializableByteBufferMap.wrap((Map<Integer, ByteBuffer>) value);
+        this.nanValueCounts = (Map<Integer, Long>) value;
         return;
       case 10:
-        this.upperBounds = SerializableByteBufferMap.wrap((Map<Integer, ByteBuffer>) value);
+        this.lowerBounds = SerializableByteBufferMap.wrap((Map<Integer, ByteBuffer>) value);
         return;
       case 11:
-        this.keyMetadata = ByteBuffers.toByteArray((ByteBuffer) value);
+        this.upperBounds = SerializableByteBufferMap.wrap((Map<Integer, ByteBuffer>) value);
         return;
       case 12:
-        this.splitOffsets = ArrayUtil.toLongArray((List<Long>) value);
+        this.keyMetadata = ByteBuffers.toByteArray((ByteBuffer) value);
         return;
       case 13:
+        this.splitOffsets = ArrayUtil.toLongArray((List<Long>) value);
+        return;
+      case 14:
         this.equalityIds = ArrayUtil.toIntArray((List<Integer>) value);
+        return;
+      case 15:
+        this.sortOrderId = (Integer) value;
+        return;
+      case 16:
+        this.fileOrdinal = (long) value;
         return;
       default:
         // ignore the object, it must be from a newer version of the format
@@ -292,15 +315,21 @@ abstract class BaseFile<F>
       case 8:
         return nullValueCounts;
       case 9:
-        return lowerBounds;
+        return nanValueCounts;
       case 10:
-        return upperBounds;
+        return lowerBounds;
       case 11:
-        return keyMetadata();
+        return upperBounds;
       case 12:
-        return splitOffsets();
+        return keyMetadata();
       case 13:
+        return splitOffsets();
+      case 14:
         return equalityFieldIds();
+      case 15:
+        return sortOrderId;
+      case 16:
+        return pos;
       default:
         throw new UnsupportedOperationException("Unknown field ordinal: " + pos);
     }
@@ -314,6 +343,11 @@ abstract class BaseFile<F>
   @Override
   public int size() {
     return DataFile.getType(EMPTY_STRUCT_TYPE).fields().size();
+  }
+
+  @Override
+  public Long pos() {
+    return fileOrdinal;
   }
 
   @Override
@@ -362,6 +396,11 @@ abstract class BaseFile<F>
   }
 
   @Override
+  public Map<Integer, Long> nanValueCounts() {
+    return nanValueCounts;
+  }
+
+  @Override
   public Map<Integer, ByteBuffer> lowerBounds() {
     return lowerBounds;
   }
@@ -386,6 +425,11 @@ abstract class BaseFile<F>
     return ArrayUtil.toIntList(equalityIds);
   }
 
+  @Override
+  public Integer sortOrderId() {
+    return sortOrderId;
+  }
+
   private static <K, V> Map<K, V> copy(Map<K, V> map) {
     if (map != null) {
       Map<K, V> copy = Maps.newHashMapWithExpectedSize(map.size());
@@ -407,11 +451,13 @@ abstract class BaseFile<F>
         .add("column_sizes", columnSizes)
         .add("value_counts", valueCounts)
         .add("null_value_counts", nullValueCounts)
+        .add("nan_value_counts", nanValueCounts)
         .add("lower_bounds", lowerBounds)
         .add("upper_bounds", upperBounds)
         .add("key_metadata", keyMetadata == null ? "null" : "(redacted)")
         .add("split_offsets", splitOffsets == null ? "null" : splitOffsets())
         .add("equality_ids", equalityIds == null ? "null" : equalityFieldIds())
+        .add("sort_order_id", sortOrderId)
         .toString();
   }
 

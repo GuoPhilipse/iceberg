@@ -121,11 +121,13 @@ public class DataFiles {
     private FileFormat format = null;
     private long recordCount = -1L;
     private long fileSizeInBytes = -1L;
+    private int sortOrderId = SortOrder.unsorted().orderId();
 
     // optional fields
     private Map<Integer, Long> columnSizes = null;
     private Map<Integer, Long> valueCounts = null;
     private Map<Integer, Long> nullValueCounts = null;
+    private Map<Integer, Long> nanValueCounts = null;
     private Map<Integer, ByteBuffer> lowerBounds = null;
     private Map<Integer, ByteBuffer> upperBounds = null;
     private ByteBuffer keyMetadata = null;
@@ -149,9 +151,11 @@ public class DataFiles {
       this.columnSizes = null;
       this.valueCounts = null;
       this.nullValueCounts = null;
+      this.nanValueCounts = null;
       this.lowerBounds = null;
       this.upperBounds = null;
       this.splitOffsets = null;
+      this.sortOrderId = SortOrder.unsorted().orderId();
     }
 
     public Builder copy(DataFile toCopy) {
@@ -166,11 +170,13 @@ public class DataFiles {
       this.columnSizes = toCopy.columnSizes();
       this.valueCounts = toCopy.valueCounts();
       this.nullValueCounts = toCopy.nullValueCounts();
+      this.nanValueCounts = toCopy.nanValueCounts();
       this.lowerBounds = toCopy.lowerBounds();
       this.upperBounds = toCopy.upperBounds();
       this.keyMetadata = toCopy.keyMetadata() == null ? null
           : ByteBuffers.copy(toCopy.keyMetadata());
       this.splitOffsets = toCopy.splitOffsets() == null ? null : copyList(toCopy.splitOffsets());
+      this.sortOrderId = toCopy.sortOrderId();
       return this;
     }
 
@@ -241,6 +247,7 @@ public class DataFiles {
       this.columnSizes = metrics.columnSizes();
       this.valueCounts = metrics.valueCounts();
       this.nullValueCounts = metrics.nullValueCounts();
+      this.nanValueCounts = metrics.nanValueCounts();
       this.lowerBounds = metrics.lowerBounds();
       this.upperBounds = metrics.upperBounds();
       return this;
@@ -264,6 +271,13 @@ public class DataFiles {
       return withEncryptionKeyMetadata(newKeyMetadata.buffer());
     }
 
+    public Builder withSortOrder(SortOrder newSortOrder) {
+      if (newSortOrder != null) {
+        this.sortOrderId = newSortOrder.orderId();
+      }
+      return this;
+    }
+
     public DataFile build() {
       Preconditions.checkArgument(filePath != null, "File path is required");
       if (format == null) {
@@ -276,8 +290,8 @@ public class DataFiles {
       return new GenericDataFile(
           specId, filePath, format, isPartitioned ? partitionData.copy() : null,
           fileSizeInBytes, new Metrics(
-              recordCount, columnSizes, valueCounts, nullValueCounts, lowerBounds, upperBounds),
-          keyMetadata, splitOffsets);
+              recordCount, columnSizes, valueCounts, nullValueCounts, nanValueCounts, lowerBounds, upperBounds),
+          keyMetadata, splitOffsets, sortOrderId);
     }
   }
 

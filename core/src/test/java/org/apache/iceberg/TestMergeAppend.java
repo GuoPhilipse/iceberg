@@ -23,6 +23,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.apache.iceberg.ManifestEntry.Status;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -238,8 +239,10 @@ public class TestMergeAppend extends TableTestBase {
   public void testManifestMergeMinCount() throws IOException {
     Assert.assertEquals("Table should start empty", 0, listManifestFiles().size());
     table.updateProperties().set(TableProperties.MANIFEST_MIN_MERGE_COUNT, "2")
-        // each manifest file is 5227 bytes, so 12000 bytes limit will give us 2 bins with 3 manifest/data files.
-        .set(TableProperties.MANIFEST_TARGET_SIZE_BYTES, "12000")
+        // Each initial v1/v2 ManifestFile is 5661/6397 bytes respectively. Merging two of the given
+        // manifests make one v1/v2 ManifestFile of 5672/6408 bytes respectively, so 15000 bytes
+        // limit will give us two bins with three manifest/data files.
+        .set(TableProperties.MANIFEST_TARGET_SIZE_BYTES, "15000")
         .commit();
 
     TableMetadata base = readMetadata();
@@ -746,7 +749,7 @@ public class TestMergeAppend extends TableTestBase {
     V2Assert.assertEquals("Last sequence number should be 2", 2, readMetadata().lastSequenceNumber());
     V1Assert.assertEquals("Table should end with last-sequence-number 0", 0, readMetadata().lastSequenceNumber());
 
-    DataFile newFileY = DataFiles.builder(newSpec)
+    DataFile newFileY = DataFiles.builder(table.spec())
         .withPath("/path/to/data-y.parquet")
         .withFileSizeInBytes(10)
         .withPartitionPath("data_bucket=2/id_bucket=3")
@@ -1174,5 +1177,76 @@ public class TestMergeAppend extends TableTestBase {
     field = ((PartitionData) entry.file().partition()).getPartitionType().fields().get(0);
     Assert.assertEquals(1000, field.fieldId());
     Assert.assertEquals("data_bucket", field.name());
+  }
+
+  @Test
+  public void testDefaultPartitionSummaries() {
+    table.newFastAppend()
+        .appendFile(FILE_A)
+        .commit();
+
+    Set<String> partitionSummaryKeys = table.currentSnapshot().summary().keySet().stream()
+        .filter(key -> key.startsWith(SnapshotSummary.CHANGED_PARTITION_PREFIX))
+        .collect(Collectors.toSet());
+    Assert.assertEquals("Should include no partition summaries by default", 0, partitionSummaryKeys.size());
+
+    String summariesIncluded = table.currentSnapshot().summary()
+        .getOrDefault(SnapshotSummary.PARTITION_SUMMARY_PROP, "false");
+    Assert.assertEquals("Should not set partition-summaries-included to true", "false", summariesIncluded);
+
+    String changedPartitions = table.currentSnapshot().summary().get(SnapshotSummary.CHANGED_PARTITION_COUNT_PROP);
+    Assert.assertEquals("Should set changed partition count", "1", changedPartitions);
+  }
+
+  @Test
+  public void testIncludedPartitionSummaries() {
+    table.updateProperties()
+        .set(TableProperties.WRITE_PARTITION_SUMMARY_LIMIT, "1")
+        .commit();
+
+    table.newFastAppend()
+        .appendFile(FILE_A)
+        .commit();
+
+    Set<String> partitionSummaryKeys = table.currentSnapshot().summary().keySet().stream()
+        .filter(key -> key.startsWith(SnapshotSummary.CHANGED_PARTITION_PREFIX))
+        .collect(Collectors.toSet());
+    Assert.assertEquals("Should include a partition summary", 1, partitionSummaryKeys.size());
+
+    String summariesIncluded = table.currentSnapshot().summary()
+        .getOrDefault(SnapshotSummary.PARTITION_SUMMARY_PROP, "false");
+    Assert.assertEquals("Should set partition-summaries-included to true", "true", summariesIncluded);
+
+    String changedPartitions = table.currentSnapshot().summary().get(SnapshotSummary.CHANGED_PARTITION_COUNT_PROP);
+    Assert.assertEquals("Should set changed partition count", "1", changedPartitions);
+
+    String partitionSummary = table.currentSnapshot().summary()
+        .get(SnapshotSummary.CHANGED_PARTITION_PREFIX + "data_bucket=0");
+    Assert.assertEquals("Summary should include 1 file with 1 record that is 10 bytes",
+        "added-data-files=1,added-records=1,added-files-size=10", partitionSummary);
+  }
+
+  @Test
+  public void testIncludedPartitionSummaryLimit() {
+    table.updateProperties()
+        .set(TableProperties.WRITE_PARTITION_SUMMARY_LIMIT, "1")
+        .commit();
+
+    table.newFastAppend()
+        .appendFile(FILE_A)
+        .appendFile(FILE_B)
+        .commit();
+
+    Set<String> partitionSummaryKeys = table.currentSnapshot().summary().keySet().stream()
+        .filter(key -> key.startsWith(SnapshotSummary.CHANGED_PARTITION_PREFIX))
+        .collect(Collectors.toSet());
+    Assert.assertEquals("Should include no partition summaries, over limit", 0, partitionSummaryKeys.size());
+
+    String summariesIncluded = table.currentSnapshot().summary()
+        .getOrDefault(SnapshotSummary.PARTITION_SUMMARY_PROP, "false");
+    Assert.assertEquals("Should not set partition-summaries-included to true", "false", summariesIncluded);
+
+    String changedPartitions = table.currentSnapshot().summary().get(SnapshotSummary.CHANGED_PARTITION_COUNT_PROP);
+    Assert.assertEquals("Should set changed partition count", "2", changedPartitions);
   }
 }

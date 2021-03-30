@@ -32,6 +32,7 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.types.Types.StructType;
+import org.apache.iceberg.util.NaNUtil;
 
 import static org.apache.iceberg.expressions.Expressions.rewriteNot;
 
@@ -44,6 +45,11 @@ import static org.apache.iceberg.expressions.Expressions.rewriteNot;
  * <p>
  * Files are passed to {@link #eval(ContentFile)}, which returns true if all rows in the file must
  * contain matching rows and false if the file may contain rows that do not match.
+ * <p>
+ * Due to the comparison implementation of ORC stats, for float/double columns in ORC files, if the first
+ * value in a file is NaN, metrics of this file will report NaN for both upper and lower bound despite
+ * that the column could contain non-NaN data. Thus in some scenarios explicitly checks for NaN is necessary
+ * in order to not include files that may contain rows that don't match.
  */
 public class StrictMetricsEvaluator {
   private final Schema schema;
@@ -57,10 +63,10 @@ public class StrictMetricsEvaluator {
   }
 
   /**
-   * Test whether the file may contain records that match the expression.
+   * Test whether all records within the file match the expression.
    *
    * @param file a data file
-   * @return false if the file cannot contain rows that match the expression, true otherwise.
+   * @return false if the file may contain any row that doesn't match the expression, true otherwise.
    */
   public boolean eval(ContentFile<?> file) {
     // TODO: detect the case where a column is missing from the file using file's max field id.
@@ -73,6 +79,7 @@ public class StrictMetricsEvaluator {
   private class MetricsEvalVisitor extends BoundExpressionVisitor<Boolean> {
     private Map<Integer, Long> valueCounts = null;
     private Map<Integer, Long> nullCounts = null;
+    private Map<Integer, Long> nanCounts = null;
     private Map<Integer, ByteBuffer> lowerBounds = null;
     private Map<Integer, ByteBuffer> upperBounds = null;
 
@@ -83,6 +90,7 @@ public class StrictMetricsEvaluator {
 
       this.valueCounts = file.valueCounts();
       this.nullCounts = file.nullValueCounts();
+      this.nanCounts = file.nanValueCounts();
       this.lowerBounds = file.lowerBounds();
       this.upperBounds = file.upperBounds();
 
@@ -118,7 +126,7 @@ public class StrictMetricsEvaluator {
     public <T> Boolean isNull(BoundReference<T> ref) {
       // no need to check whether the field is required because binding evaluates that case
       // if the column has any non-null values, the expression does not match
-      Integer id = ref.fieldId();
+      int id = ref.fieldId();
       Preconditions.checkNotNull(struct.field(id),
           "Cannot filter by nested column: %s", schema.findField(id));
 
@@ -133,11 +141,37 @@ public class StrictMetricsEvaluator {
     public <T> Boolean notNull(BoundReference<T> ref) {
       // no need to check whether the field is required because binding evaluates that case
       // if the column has any null values, the expression does not match
-      Integer id = ref.fieldId();
+      int id = ref.fieldId();
       Preconditions.checkNotNull(struct.field(id),
           "Cannot filter by nested column: %s", schema.findField(id));
 
       if (nullCounts != null && nullCounts.containsKey(id) && nullCounts.get(id) == 0) {
+        return ROWS_MUST_MATCH;
+      }
+
+      return ROWS_MIGHT_NOT_MATCH;
+    }
+
+    @Override
+    public <T> Boolean isNaN(BoundReference<T> ref) {
+      int id = ref.fieldId();
+
+      if (containsNaNsOnly(id)) {
+        return ROWS_MUST_MATCH;
+      }
+
+      return ROWS_MIGHT_NOT_MATCH;
+    }
+
+    @Override
+    public <T> Boolean notNaN(BoundReference<T> ref) {
+      int id = ref.fieldId();
+
+      if (nanCounts != null && nanCounts.containsKey(id) && nanCounts.get(id) == 0) {
+        return ROWS_MUST_MATCH;
+      }
+
+      if (containsNullsOnly(id)) {
         return ROWS_MUST_MATCH;
       }
 
@@ -151,7 +185,7 @@ public class StrictMetricsEvaluator {
       Types.NestedField field = struct.field(id);
       Preconditions.checkNotNull(field, "Cannot filter by nested column: %s", schema.findField(id));
 
-      if (canContainNulls(id)) {
+      if (canContainNulls(id) || canContainNaNs(id)) {
         return ROWS_MIGHT_NOT_MATCH;
       }
 
@@ -174,7 +208,7 @@ public class StrictMetricsEvaluator {
       Types.NestedField field = struct.field(id);
       Preconditions.checkNotNull(field, "Cannot filter by nested column: %s", schema.findField(id));
 
-      if (canContainNulls(id)) {
+      if (canContainNulls(id) || canContainNaNs(id)) {
         return ROWS_MIGHT_NOT_MATCH;
       }
 
@@ -197,12 +231,17 @@ public class StrictMetricsEvaluator {
       Types.NestedField field = struct.field(id);
       Preconditions.checkNotNull(field, "Cannot filter by nested column: %s", schema.findField(id));
 
-      if (canContainNulls(id)) {
+      if (canContainNulls(id) || canContainNaNs(id)) {
         return ROWS_MIGHT_NOT_MATCH;
       }
 
       if (lowerBounds != null && lowerBounds.containsKey(id)) {
         T lower = Conversions.fromByteBuffer(field.type(), lowerBounds.get(id));
+
+        if (NaNUtil.isNaN(lower)) {
+          // NaN indicates unreliable bounds. See the StrictMetricsEvaluator docs for more.
+          return ROWS_MIGHT_NOT_MATCH;
+        }
 
         int cmp = lit.comparator().compare(lower, lit.value());
         if (cmp > 0) {
@@ -220,12 +259,17 @@ public class StrictMetricsEvaluator {
       Types.NestedField field = struct.field(id);
       Preconditions.checkNotNull(field, "Cannot filter by nested column: %s", schema.findField(id));
 
-      if (canContainNulls(id)) {
+      if (canContainNulls(id) || canContainNaNs(id)) {
         return ROWS_MIGHT_NOT_MATCH;
       }
 
       if (lowerBounds != null && lowerBounds.containsKey(id)) {
         T lower = Conversions.fromByteBuffer(field.type(), lowerBounds.get(id));
+
+        if (NaNUtil.isNaN(lower)) {
+          // NaN indicates unreliable bounds. See the StrictMetricsEvaluator docs for more.
+          return ROWS_MIGHT_NOT_MATCH;
+        }
 
         int cmp = lit.comparator().compare(lower, lit.value());
         if (cmp >= 0) {
@@ -243,7 +287,7 @@ public class StrictMetricsEvaluator {
       Types.NestedField field = struct.field(id);
       Preconditions.checkNotNull(field, "Cannot filter by nested column: %s", schema.findField(id));
 
-      if (canContainNulls(id)) {
+      if (canContainNulls(id) || canContainNaNs(id)) {
         return ROWS_MIGHT_NOT_MATCH;
       }
 
@@ -276,12 +320,17 @@ public class StrictMetricsEvaluator {
       Types.NestedField field = struct.field(id);
       Preconditions.checkNotNull(field, "Cannot filter by nested column: %s", schema.findField(id));
 
-      if (containsNullsOnly(id)) {
+      if (containsNullsOnly(id) || containsNaNsOnly(id)) {
         return ROWS_MUST_MATCH;
       }
 
       if (lowerBounds != null && lowerBounds.containsKey(id)) {
         T lower = Conversions.fromByteBuffer(struct.field(id).type(), lowerBounds.get(id));
+
+        if (NaNUtil.isNaN(lower)) {
+          // NaN indicates unreliable bounds. See the StrictMetricsEvaluator docs for more.
+          return ROWS_MIGHT_NOT_MATCH;
+        }
 
         int cmp = lit.comparator().compare(lower, lit.value());
         if (cmp > 0) {
@@ -307,7 +356,7 @@ public class StrictMetricsEvaluator {
       Types.NestedField field = struct.field(id);
       Preconditions.checkNotNull(field, "Cannot filter by nested column: %s", schema.findField(id));
 
-      if (canContainNulls(id)) {
+      if (canContainNulls(id) || canContainNaNs(id)) {
         return ROWS_MIGHT_NOT_MATCH;
       }
 
@@ -343,7 +392,7 @@ public class StrictMetricsEvaluator {
       Types.NestedField field = struct.field(id);
       Preconditions.checkNotNull(field, "Cannot filter by nested column: %s", schema.findField(id));
 
-      if (containsNullsOnly(id)) {
+      if (containsNullsOnly(id) || containsNaNsOnly(id)) {
         return ROWS_MUST_MATCH;
       }
 
@@ -351,6 +400,11 @@ public class StrictMetricsEvaluator {
 
       if (lowerBounds != null && lowerBounds.containsKey(id)) {
         T lower = Conversions.fromByteBuffer(struct.field(id).type(), lowerBounds.get(id));
+
+        if (NaNUtil.isNaN(lower)) {
+          // NaN indicates unreliable bounds. See the StrictMetricsEvaluator docs for more.
+          return ROWS_MIGHT_NOT_MATCH;
+        }
 
         literals = literals.stream().filter(v -> ref.comparator().compare(lower, v) <= 0).collect(Collectors.toList());
         if (literals.isEmpty()) {  // if all values are less than lower bound, rows must match (notIn).
@@ -378,10 +432,20 @@ public class StrictMetricsEvaluator {
       return nullCounts == null || (nullCounts.containsKey(id) && nullCounts.get(id) > 0);
     }
 
+    private boolean canContainNaNs(Integer id) {
+      // nan counts might be null for early version writers when nan counters are not populated.
+      return nanCounts != null && nanCounts.containsKey(id) && nanCounts.get(id) > 0;
+    }
+
     private boolean containsNullsOnly(Integer id) {
       return valueCounts != null && valueCounts.containsKey(id) &&
           nullCounts != null && nullCounts.containsKey(id) &&
           valueCounts.get(id) - nullCounts.get(id) == 0;
+    }
+
+    private boolean containsNaNsOnly(Integer id) {
+      return nanCounts != null && nanCounts.containsKey(id) &&
+          valueCounts != null && nanCounts.get(id).equals(valueCounts.get(id));
     }
   }
 }

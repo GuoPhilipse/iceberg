@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import org.apache.iceberg.events.Listeners;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -133,6 +134,16 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   protected abstract String operation();
 
   /**
+   * Validate the current metadata.
+   * <p>
+   * Child operations can override this to add custom validation.
+   *
+   * @param currentMetadata current table metadata to validate
+   */
+  protected void validate(TableMetadata currentMetadata) {
+  }
+
+  /**
    * Apply the update's changes to the base table metadata and return the new manifest list.
    *
    * @param metadataToUpdate the base table metadata to apply changes to
@@ -146,6 +157,9 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
     Long parentSnapshotId = base.currentSnapshot() != null ?
         base.currentSnapshot().snapshotId() : null;
     long sequenceNumber = base.nextSequenceNumber();
+
+    // run validations from the child operation
+    validate(base);
 
     List<ManifestFile> manifests = apply(base);
 
@@ -205,12 +219,15 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
       }
     } else {
       // if there was no previous snapshot, default the summary to start totals at 0
-      previousSummary = ImmutableMap.of(
-          SnapshotSummary.TOTAL_RECORDS_PROP, "0",
-          SnapshotSummary.TOTAL_DATA_FILES_PROP, "0",
-          SnapshotSummary.TOTAL_DELETE_FILES_PROP, "0",
-          SnapshotSummary.TOTAL_POS_DELETES_PROP, "0",
-          SnapshotSummary.TOTAL_EQ_DELETES_PROP, "0");
+      ImmutableMap.Builder<String, String> summaryBuilder = ImmutableMap.builder();
+      summaryBuilder
+          .put(SnapshotSummary.TOTAL_RECORDS_PROP, "0")
+          .put(SnapshotSummary.TOTAL_FILE_SIZE_PROP, "0")
+          .put(SnapshotSummary.TOTAL_DATA_FILES_PROP, "0")
+          .put(SnapshotSummary.TOTAL_DELETE_FILES_PROP, "0")
+          .put(SnapshotSummary.TOTAL_POS_DELETES_PROP, "0")
+          .put(SnapshotSummary.TOTAL_EQ_DELETES_PROP, "0");
+      previousSummary = summaryBuilder.build();
     }
 
     ImmutableMap.Builder<String, String> builder = ImmutableMap.builder();
@@ -221,6 +238,9 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
     updateTotal(
         builder, previousSummary, SnapshotSummary.TOTAL_RECORDS_PROP,
         summary, SnapshotSummary.ADDED_RECORDS_PROP, SnapshotSummary.DELETED_RECORDS_PROP);
+    updateTotal(
+        builder, previousSummary, SnapshotSummary.TOTAL_FILE_SIZE_PROP,
+        summary, SnapshotSummary.ADDED_FILE_SIZE_PROP, SnapshotSummary.REMOVED_FILE_SIZE_PROP);
     updateTotal(
         builder, previousSummary, SnapshotSummary.TOTAL_DATA_FILES_PROP,
         summary, SnapshotSummary.ADDED_FILES_PROP, SnapshotSummary.DELETED_FILES_PROP);
@@ -280,6 +300,8 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
             taskOps.commit(base, updated.withUUID());
           });
 
+    } catch (CommitStateUnknownException commitStateUnknownException) {
+      throw commitStateUnknownException;
     } catch (RuntimeException e) {
       Exceptions.suppressAndThrow(e, this::cleanAll);
     }

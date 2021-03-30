@@ -20,80 +20,102 @@
 package org.apache.iceberg.flink;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.TableSchema;
+import org.apache.flink.table.connector.ChangelogMode;
+import org.apache.flink.table.connector.source.DataStreamScanProvider;
+import org.apache.flink.table.connector.source.DynamicTableSource;
+import org.apache.flink.table.connector.source.ScanTableSource;
+import org.apache.flink.table.connector.source.abilities.SupportsFilterPushDown;
+import org.apache.flink.table.connector.source.abilities.SupportsLimitPushDown;
+import org.apache.flink.table.connector.source.abilities.SupportsProjectionPushDown;
 import org.apache.flink.table.data.RowData;
-import org.apache.flink.table.sources.FilterableTableSource;
-import org.apache.flink.table.sources.LimitableTableSource;
-import org.apache.flink.table.sources.ProjectableTableSource;
-import org.apache.flink.table.sources.StreamTableSource;
-import org.apache.flink.table.sources.TableSource;
+import org.apache.flink.table.expressions.ResolvedExpression;
 import org.apache.flink.table.types.DataType;
-import org.apache.flink.table.utils.TableConnectorUtils;
-import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.flink.source.FlinkSource;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
 /**
  * Flink Iceberg table source.
- * TODO: Implement {@link FilterableTableSource} and {@link LimitableTableSource}.
  */
-public class IcebergTableSource implements StreamTableSource<RowData>, ProjectableTableSource<RowData> {
+public class IcebergTableSource
+    implements ScanTableSource, SupportsProjectionPushDown, SupportsFilterPushDown, SupportsLimitPushDown {
+
+  private int[] projectedFields;
+  private long limit;
+  private List<Expression> filters;
 
   private final TableLoader loader;
-  private final Configuration hadoopConf;
   private final TableSchema schema;
-  private final Map<String, String> options;
-  private final int[] projectedFields;
+  private final Map<String, String> properties;
+  private final boolean isLimitPushDown;
+  private final ReadableConfig readableConfig;
 
-  public IcebergTableSource(TableLoader loader, Configuration hadoopConf, TableSchema schema,
-                            Map<String, String> options) {
-    this(loader, hadoopConf, schema, options, null);
+  private IcebergTableSource(IcebergTableSource toCopy) {
+    this.loader = toCopy.loader;
+    this.schema = toCopy.schema;
+    this.properties = toCopy.properties;
+    this.projectedFields = toCopy.projectedFields;
+    this.isLimitPushDown = toCopy.isLimitPushDown;
+    this.limit = toCopy.limit;
+    this.filters = toCopy.filters;
+    this.readableConfig = toCopy.readableConfig;
   }
 
-  private IcebergTableSource(TableLoader loader, Configuration hadoopConf, TableSchema schema,
-                             Map<String, String> options, int[] projectedFields) {
+  public IcebergTableSource(TableLoader loader, TableSchema schema, Map<String, String> properties,
+                            ReadableConfig readableConfig) {
+    this(loader, schema, properties, null, false, -1, ImmutableList.of(), readableConfig);
+  }
+
+  private IcebergTableSource(TableLoader loader, TableSchema schema, Map<String, String> properties,
+                             int[] projectedFields, boolean isLimitPushDown,
+                             long limit, List<Expression> filters, ReadableConfig readableConfig) {
     this.loader = loader;
-    this.hadoopConf = hadoopConf;
     this.schema = schema;
-    this.options = options;
+    this.properties = properties;
     this.projectedFields = projectedFields;
+    this.isLimitPushDown = isLimitPushDown;
+    this.limit = limit;
+    this.filters = filters;
+    this.readableConfig = readableConfig;
   }
 
   @Override
-  public boolean isBounded() {
-    return FlinkSource.isBounded(options);
+  public void applyProjection(int[][] projectFields) {
+    this.projectedFields = new int[projectFields.length];
+    for (int i = 0; i < projectFields.length; i++) {
+      Preconditions.checkArgument(projectFields[i].length == 1,
+          "Don't support nested projection in iceberg source now.");
+      this.projectedFields[i] = projectFields[i][0];
+    }
   }
 
-  @Override
-  public TableSource<RowData> projectFields(int[] fields) {
-    return new IcebergTableSource(loader, hadoopConf, schema, options, fields);
-  }
-
-  @Override
-  public DataStream<RowData> getDataStream(StreamExecutionEnvironment execEnv) {
-    return FlinkSource.forRowData().env(execEnv).tableLoader(loader).hadoopConf(hadoopConf)
-        .project(getProjectedSchema()).properties(options).build();
-  }
-
-  @Override
-  public TableSchema getTableSchema() {
-    return schema;
-  }
-
-  @Override
-  public DataType getProducedDataType() {
-    return getProjectedSchema().toRowDataType().bridgedTo(RowData.class);
+  private DataStream<RowData> createDataStream(StreamExecutionEnvironment execEnv) {
+    return FlinkSource.forRowData()
+        .env(execEnv)
+        .tableLoader(loader)
+        .properties(properties)
+        .project(getProjectedSchema())
+        .limit(limit)
+        .filters(filters)
+        .flinkConf(readableConfig)
+        .build();
   }
 
   private TableSchema getProjectedSchema() {
-    TableSchema fullSchema = getTableSchema();
     if (projectedFields == null) {
-      return fullSchema;
+      return schema;
     } else {
-      String[] fullNames = fullSchema.getFieldNames();
-      DataType[] fullTypes = fullSchema.getFieldDataTypes();
+      String[] fullNames = schema.getFieldNames();
+      DataType[] fullTypes = schema.getFieldDataTypes();
       return TableSchema.builder().fields(
           Arrays.stream(projectedFields).mapToObj(i -> fullNames[i]).toArray(String[]::new),
           Arrays.stream(projectedFields).mapToObj(i -> fullTypes[i]).toArray(DataType[]::new)).build();
@@ -101,11 +123,60 @@ public class IcebergTableSource implements StreamTableSource<RowData>, Projectab
   }
 
   @Override
-  public String explainSource() {
-    String explain = "Iceberg table: " + loader.toString();
-    if (projectedFields != null) {
-      explain += ", ProjectedFields: " + Arrays.toString(projectedFields);
+  public void applyLimit(long newLimit) {
+    this.limit = newLimit;
+  }
+
+  @Override
+  public Result applyFilters(List<ResolvedExpression> flinkFilters) {
+    List<ResolvedExpression> acceptedFilters = Lists.newArrayList();
+    List<Expression> expressions = Lists.newArrayList();
+
+    for (ResolvedExpression resolvedExpression : flinkFilters) {
+      Optional<Expression> icebergExpression = FlinkFilters.convert(resolvedExpression);
+      if (icebergExpression.isPresent()) {
+        expressions.add(icebergExpression.get());
+        acceptedFilters.add(resolvedExpression);
+      }
     }
-    return TableConnectorUtils.generateRuntimeName(getClass(), getTableSchema().getFieldNames()) + explain;
+
+    this.filters = expressions;
+    return Result.of(acceptedFilters, flinkFilters);
+  }
+
+  @Override
+  public boolean supportsNestedProjection() {
+    // TODO: support nested projection
+    return false;
+  }
+
+  @Override
+  public ChangelogMode getChangelogMode() {
+    return ChangelogMode.insertOnly();
+  }
+
+  @Override
+  public ScanRuntimeProvider getScanRuntimeProvider(ScanContext runtimeProviderContext) {
+    return new DataStreamScanProvider() {
+      @Override
+      public DataStream<RowData> produceDataStream(StreamExecutionEnvironment execEnv) {
+        return createDataStream(execEnv);
+      }
+
+      @Override
+      public boolean isBounded() {
+        return FlinkSource.isBounded(properties);
+      }
+    };
+  }
+
+  @Override
+  public DynamicTableSource copy() {
+    return new IcebergTableSource(this);
+  }
+
+  @Override
+  public String asSummaryString() {
+    return "Iceberg table source";
   }
 }

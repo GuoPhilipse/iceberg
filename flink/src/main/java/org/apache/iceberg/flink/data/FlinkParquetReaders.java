@@ -26,7 +26,6 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
-import org.apache.commons.lang3.ArrayUtils;
 import org.apache.flink.table.data.ArrayData;
 import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.GenericRowData;
@@ -35,6 +34,7 @@ import org.apache.flink.table.data.RawValueData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.parquet.ParquetValueReader;
 import org.apache.iceberg.parquet.ParquetValueReaders;
@@ -44,6 +44,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.ArrayUtil;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.schema.GroupType;
@@ -93,11 +94,13 @@ public class FlinkParquetReaders {
       List<Type> fields = struct.getFields();
       for (int i = 0; i < fields.size(); i += 1) {
         Type fieldType = fields.get(i);
-        int fieldD = type.getMaxDefinitionLevel(path(fieldType.getName())) - 1;
-        if (fieldType.getId() != null) {
-          int id = fieldType.getId().intValue();
-          readersById.put(id, ParquetValueReaders.option(fieldType, fieldD, fieldReaders.get(i)));
-          typesById.put(id, fieldType);
+        if (fieldReaders.get(i) != null) {
+          int fieldD = type.getMaxDefinitionLevel(path(fieldType.getName())) - 1;
+          if (fieldType.getId() != null) {
+            int id = fieldType.getId().intValue();
+            readersById.put(id, ParquetValueReaders.option(fieldType, fieldD, fieldReaders.get(i)));
+            typesById.put(id, fieldType);
+          }
         }
       }
 
@@ -111,6 +114,9 @@ public class FlinkParquetReaders {
         if (idToConstant.containsKey(id)) {
           // containsKey is used because the constant may be null
           reorderedFields.add(ParquetValueReaders.constant(idToConstant.get(id)));
+          types.add(null);
+        } else if (id == MetadataColumns.ROW_POSITION.fieldId()) {
+          reorderedFields.add(ParquetValueReaders.position());
           types.add(null);
         } else {
           ParquetValueReader<?> reader = readersById.get(id);
@@ -130,6 +136,10 @@ public class FlinkParquetReaders {
     @Override
     public ParquetValueReader<?> list(Types.ListType expectedList, GroupType array,
                                       ParquetValueReader<?> elementReader) {
+      if (expectedList == null) {
+        return null;
+      }
+
       GroupType repeated = array.getFields().get(0).asGroupType();
       String[] repeatedPath = currentPath();
 
@@ -146,6 +156,10 @@ public class FlinkParquetReaders {
     public ParquetValueReader<?> map(Types.MapType expectedMap, GroupType map,
                                      ParquetValueReader<?> keyReader,
                                      ParquetValueReader<?> valueReader) {
+      if (expectedMap == null) {
+        return null;
+      }
+
       GroupType repeatedKeyValue = map.getFields().get(0).asGroupType();
       String[] repeatedPath = currentPath();
 
@@ -166,6 +180,10 @@ public class FlinkParquetReaders {
     @SuppressWarnings("CyclomaticComplexity")
     public ParquetValueReader<?> primitive(org.apache.iceberg.types.Type.PrimitiveType expected,
                                            PrimitiveType primitive) {
+      if (expected == null) {
+        return null;
+      }
+
       ColumnDescriptor desc = type.getColumnDescription(currentPath());
 
       if (primitive.getOriginalType() != null) {
@@ -177,7 +195,7 @@ public class FlinkParquetReaders {
           case INT_8:
           case INT_16:
           case INT_32:
-            if (expected != null && expected.typeId() == Types.LongType.get().typeId()) {
+            if (expected.typeId() == Types.LongType.get().typeId()) {
               return new ParquetValueReaders.IntAsLongReader(desc);
             } else {
               return new ParquetValueReaders.UnboxedReader<>(desc);
@@ -228,13 +246,13 @@ public class FlinkParquetReaders {
         case BINARY:
           return new ParquetValueReaders.ByteArrayReader(desc);
         case INT32:
-          if (expected != null && expected.typeId() == org.apache.iceberg.types.Type.TypeID.LONG) {
+          if (expected.typeId() == org.apache.iceberg.types.Type.TypeID.LONG) {
             return new ParquetValueReaders.IntAsLongReader(desc);
           } else {
             return new ParquetValueReaders.UnboxedReader<>(desc);
           }
         case FLOAT:
-          if (expected != null && expected.typeId() == org.apache.iceberg.types.Type.TypeID.DOUBLE) {
+          if (expected.typeId() == org.apache.iceberg.types.Type.TypeID.DOUBLE) {
             return new ParquetValueReaders.FloatAsDoubleReader(desc);
           } else {
             return new ParquetValueReaders.UnboxedReader<>(desc);
@@ -742,37 +760,37 @@ public class FlinkParquetReaders {
 
     @Override
     public boolean[] toBooleanArray() {
-      return ArrayUtils.toPrimitive((Boolean[]) values);
+      return ArrayUtil.toPrimitive((Boolean[]) values);
     }
 
     @Override
     public byte[] toByteArray() {
-      return ArrayUtils.toPrimitive((Byte[]) values);
+      return ArrayUtil.toPrimitive((Byte[]) values);
     }
 
     @Override
     public short[] toShortArray() {
-      return ArrayUtils.toPrimitive((Short[]) values);
+      return ArrayUtil.toPrimitive((Short[]) values);
     }
 
     @Override
     public int[] toIntArray() {
-      return ArrayUtils.toPrimitive((Integer[]) values);
+      return ArrayUtil.toPrimitive((Integer[]) values);
     }
 
     @Override
     public long[] toLongArray() {
-      return ArrayUtils.toPrimitive((Long[]) values);
+      return ArrayUtil.toPrimitive((Long[]) values);
     }
 
     @Override
     public float[] toFloatArray() {
-      return ArrayUtils.toPrimitive((Float[]) values);
+      return ArrayUtil.toPrimitive((Float[]) values);
     }
 
     @Override
     public double[] toDoubleArray() {
-      return ArrayUtils.toPrimitive((Double[]) values);
+      return ArrayUtil.toPrimitive((Double[]) values);
     }
   }
 }

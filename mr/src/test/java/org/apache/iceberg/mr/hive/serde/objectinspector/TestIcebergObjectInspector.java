@@ -26,8 +26,8 @@ import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.PrimitiveObjectInspectorFactory;
 import org.apache.hadoop.hive.serde2.typeinfo.PrimitiveTypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
-import org.apache.iceberg.AssertHelpers;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.hive.MetastoreUtil;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.types.Types;
 import org.junit.Assert;
@@ -60,7 +60,8 @@ public class TestIcebergObjectInspector {
           required(19, "struct_field", Types.StructType.of(
                   Types.NestedField.required(20, "nested_field", Types.StringType.get(), "nested field comment")),
                   "struct comment"
-          )
+          ),
+          required(21, "time_field", Types.TimeType.get(), "time comment")
   );
 
   @Test
@@ -76,7 +77,7 @@ public class TestIcebergObjectInspector {
     Assert.assertEquals(1, binaryField.getFieldID());
     Assert.assertEquals("binary_field", binaryField.getFieldName());
     Assert.assertEquals("binary comment", binaryField.getFieldComment());
-    Assert.assertEquals(IcebergBinaryObjectInspector.byteBuffer(), binaryField.getFieldObjectInspector());
+    Assert.assertEquals(IcebergBinaryObjectInspector.get(), binaryField.getFieldObjectInspector());
 
     // boolean
     StructField booleanField = soi.getStructFieldRef("boolean_field");
@@ -90,7 +91,13 @@ public class TestIcebergObjectInspector {
     Assert.assertEquals(3, dateField.getFieldID());
     Assert.assertEquals("date_field", dateField.getFieldName());
     Assert.assertEquals("date comment", dateField.getFieldComment());
-    Assert.assertEquals(IcebergDateObjectInspector.get(), dateField.getFieldObjectInspector());
+    if (MetastoreUtil.hive3PresentOnClasspath()) {
+      Assert.assertEquals("org.apache.iceberg.mr.hive.serde.objectinspector.IcebergDateObjectInspectorHive3",
+              dateField.getFieldObjectInspector().getClass().getName());
+    } else {
+      Assert.assertEquals("org.apache.iceberg.mr.hive.serde.objectinspector.IcebergDateObjectInspector",
+              dateField.getFieldObjectInspector().getClass().getName());
+    }
 
     // decimal
     StructField decimalField = soi.getStructFieldRef("decimal_field");
@@ -111,7 +118,7 @@ public class TestIcebergObjectInspector {
     Assert.assertEquals(6, fixedField.getFieldID());
     Assert.assertEquals("fixed_field", fixedField.getFieldName());
     Assert.assertEquals("fixed comment", fixedField.getFieldComment());
-    Assert.assertEquals(IcebergBinaryObjectInspector.byteArray(), fixedField.getFieldObjectInspector());
+    Assert.assertEquals(IcebergFixedObjectInspector.get(), fixedField.getFieldObjectInspector());
 
     // float
     StructField floatField = soi.getStructFieldRef("float_field");
@@ -146,21 +153,31 @@ public class TestIcebergObjectInspector {
     Assert.assertEquals(11, timestampField.getFieldID());
     Assert.assertEquals("timestamp_field", timestampField.getFieldName());
     Assert.assertEquals("timestamp comment", timestampField.getFieldComment());
-    Assert.assertEquals(IcebergTimestampObjectInspector.get(false), timestampField.getFieldObjectInspector());
+    if (MetastoreUtil.hive3PresentOnClasspath()) {
+      Assert.assertEquals("IcebergTimestampObjectInspectorHive3",
+          timestampField.getFieldObjectInspector().getClass().getSimpleName());
+    } else {
+      Assert.assertEquals(IcebergTimestampObjectInspector.get(), timestampField.getFieldObjectInspector());
+    }
 
     // timestamp with tz
     StructField timestampTzField = soi.getStructFieldRef("timestamptz_field");
     Assert.assertEquals(12, timestampTzField.getFieldID());
     Assert.assertEquals("timestamptz_field", timestampTzField.getFieldName());
     Assert.assertEquals("timestamptz comment", timestampTzField.getFieldComment());
-    Assert.assertEquals(IcebergTimestampObjectInspector.get(true), timestampTzField.getFieldObjectInspector());
+    if (MetastoreUtil.hive3PresentOnClasspath()) {
+      Assert.assertEquals("IcebergTimestampWithZoneObjectInspectorHive3",
+          timestampTzField.getFieldObjectInspector().getClass().getSimpleName());
+    } else {
+      Assert.assertEquals(IcebergTimestampWithZoneObjectInspector.get(), timestampTzField.getFieldObjectInspector());
+    }
 
     // UUID
     StructField uuidField = soi.getStructFieldRef("uuid_field");
     Assert.assertEquals(13, uuidField.getFieldID());
     Assert.assertEquals("uuid_field", uuidField.getFieldName());
     Assert.assertEquals("uuid comment", uuidField.getFieldComment());
-    Assert.assertEquals(getPrimitiveObjectInspector(String.class), uuidField.getFieldObjectInspector());
+    Assert.assertEquals(IcebergUUIDObjectInspector.get(), uuidField.getFieldObjectInspector());
 
     // list
     StructField listField = soi.getStructFieldRef("list_field");
@@ -185,13 +202,13 @@ public class TestIcebergObjectInspector {
     ObjectInspector expectedObjectInspector = new IcebergRecordObjectInspector(
             (Types.StructType) schema.findType(19), ImmutableList.of(getPrimitiveObjectInspector(String.class)));
     Assert.assertEquals(expectedObjectInspector, structField.getFieldObjectInspector());
-  }
 
-  @Test
-  public void testIcebergObjectInspectorUnsupportedTypes() {
-    AssertHelpers.assertThrows(
-        "Hive does not support time type", IllegalArgumentException.class, "TIME type is not supported",
-        () -> IcebergObjectInspector.create(required(1, "time_field", Types.TimeType.get())));
+    // time
+    StructField timeField = soi.getStructFieldRef("time_field");
+    Assert.assertEquals(21, timeField.getFieldID());
+    Assert.assertEquals("time_field", timeField.getFieldName());
+    Assert.assertEquals("time comment", timeField.getFieldComment());
+    Assert.assertEquals(IcebergTimeObjectInspector.get(), timeField.getFieldObjectInspector());
   }
 
   private static ObjectInspector getPrimitiveObjectInspector(Class<?> clazz) {

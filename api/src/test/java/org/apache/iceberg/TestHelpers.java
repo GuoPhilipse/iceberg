@@ -28,6 +28,7 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.IntStream;
 import org.apache.iceberg.expressions.BoundPredicate;
 import org.apache.iceberg.expressions.BoundSetPredicate;
 import org.apache.iceberg.expressions.Expression;
@@ -82,6 +83,23 @@ public class TestHelpers {
         new ByteArrayInputStream(bytes.toByteArray()))) {
       return (T) in.readObject();
     }
+  }
+
+  public static void assertSameSchemaList(List<Schema> list1, List<Schema> list2) {
+    if (list1.size() != list2.size()) {
+      Assert.fail("Should have same number of schemas in both lists");
+    }
+
+    IntStream.range(0, list1.size()).forEach(
+        index -> {
+          Schema schema1 = list1.get(index);
+          Schema schema2 = list2.get(index);
+          Assert.assertEquals("Should have matching schema id",
+              schema1.schemaId(), schema2.schemaId());
+          Assert.assertEquals("Should have matching schema struct",
+              schema1.asStruct(), schema2.asStruct());
+        }
+    );
   }
 
   private static class CheckReferencesBound extends ExpressionVisitors.ExpressionVisitor<Void> {
@@ -150,11 +168,17 @@ public class TestHelpers {
 
   public static class TestFieldSummary implements ManifestFile.PartitionFieldSummary {
     private final boolean containsNull;
+    private final Boolean containsNaN;
     private final ByteBuffer lowerBound;
     private final ByteBuffer upperBound;
 
     public TestFieldSummary(boolean containsNull, ByteBuffer lowerBound, ByteBuffer upperBound) {
+      this(containsNull, null, lowerBound, upperBound);
+    }
+
+    public TestFieldSummary(boolean containsNull, Boolean containsNaN, ByteBuffer lowerBound, ByteBuffer upperBound) {
       this.containsNull = containsNull;
+      this.containsNaN = containsNaN;
       this.lowerBound = lowerBound;
       this.upperBound = upperBound;
     }
@@ -162,6 +186,11 @@ public class TestHelpers {
     @Override
     public boolean containsNull() {
       return containsNull;
+    }
+
+    @Override
+    public Boolean containsNaN() {
+      return containsNaN;
     }
 
     @Override
@@ -311,16 +340,18 @@ public class TestHelpers {
     private final long recordCount;
     private final Map<Integer, Long> valueCounts;
     private final Map<Integer, Long> nullValueCounts;
+    private final Map<Integer, Long> nanValueCounts;
     private final Map<Integer, ByteBuffer> lowerBounds;
     private final Map<Integer, ByteBuffer> upperBounds;
 
     public TestDataFile(String path, StructLike partition, long recordCount) {
-      this(path, partition, recordCount, null, null, null, null);
+      this(path, partition, recordCount, null, null, null, null, null);
     }
 
     public TestDataFile(String path, StructLike partition, long recordCount,
                         Map<Integer, Long> valueCounts,
                         Map<Integer, Long> nullValueCounts,
+                        Map<Integer, Long> nanValueCounts,
                         Map<Integer, ByteBuffer> lowerBounds,
                         Map<Integer, ByteBuffer> upperBounds) {
       this.path = path;
@@ -328,8 +359,14 @@ public class TestHelpers {
       this.recordCount = recordCount;
       this.valueCounts = valueCounts;
       this.nullValueCounts = nullValueCounts;
+      this.nanValueCounts = nanValueCounts;
       this.lowerBounds = lowerBounds;
       this.upperBounds = upperBounds;
+    }
+
+    @Override
+    public Long pos() {
+      return null;
     }
 
     @Override
@@ -375,6 +412,11 @@ public class TestHelpers {
     @Override
     public Map<Integer, Long> nullValueCounts() {
       return nullValueCounts;
+    }
+
+    @Override
+    public Map<Integer, Long> nanValueCounts() {
+      return nanValueCounts;
     }
 
     @Override

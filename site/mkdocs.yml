@@ -25,7 +25,7 @@ remote_branch: asf-site
 use_directory_urls: true
 
 theme: cinder
-copyright: "Copyright 2018-2020 <a href='https://www.apache.org/'>The Apache Software Foundation</a><br />Apache Iceberg, Iceberg, Apache, the Apache feather logo, and the Apache Iceberg project logo are either registered<br />trademarks or trademarks of The Apache Software Foundation in the United States and other countries."
+copyright: "Copyright 2018-2021 <a href='https://www.apache.org/'>The Apache Software Foundation</a><br />Apache Iceberg, Iceberg, Apache, the Apache feather logo, and the Apache Iceberg project logo are either registered<br />trademarks or trademarks of The Apache Software Foundation in the United States and other countries."
 extra_css:
   - css/extra.css
 plugins:
@@ -40,42 +40,48 @@ markdown_extensions:
   - admonition
   - pymdownx.tilde
 nav:
-  - About: index.md
   - Project:
+    - About: index.md
     - Community: community.md
     - Releases: releases.md
+    - Blogs: blogs.md
     - Trademarks: trademarks.md
     - How to Release: how-to-release.md
-  - User docs:
-    - Getting Started: getting-started.md
-    - Flink: flink.md
-    - Spark: spark.md
-    - Spark Streaming: spark-structured-streaming.md
-    - Presto: presto.md
-    - Hive: hive.md
-    - Maintenance: maintenance.md
+  - Tables:
     - Configuration: configuration.md
     - Schemas: schemas.md
     - Partitioning: partitioning.md
     - Table evolution: evolution.md
+    - Maintenance: maintenance.md
     - Performance: performance.md
     - Reliability: reliability.md
+  - Spark:
+    - Getting Started: getting-started.md
+    - Configuration: spark-configuration.md
+    - DDL: spark-ddl.md
+    - Queries: spark-queries.md
+    - Writes: spark-writes.md
+    - Maintenance Procedures: spark-procedures.md
+    - Structured Streaming: spark-structured-streaming.md
     - Time Travel: spark#time-travel
-  - Java:
-    - Git Repo: https://github.com/apache/iceberg
-    - Quickstart: java-api-quickstart.md
-    - API intro: api.md
+  - Trino: https://trino.io/docs/current/connector/iceberg.html
+  - Flink: flink.md
+  - Hive: hive.md
+  - Integrations:
+    - AWS: aws.md
+    - Nessie: nessie.md
+  - API:
     - Javadoc: /javadoc/
-    - Custom Catalog: custom-catalog.md
-  - Python:
-    - Git Repo: https://github.com/apache/iceberg/tree/master/python
-    - Quickstart: python-quickstart.md
-    - API Intro: python-api-intro.md
-    - Feature Support: python-feature-support.md
+    - Java API intro: api.md
+    - Java Quickstart: java-api-quickstart.md
+    - Java Custom Catalog: custom-catalog.md
+    - Python Quickstart: python-quickstart.md
+    - Python API Intro: python-api-intro.md
+    - Python Feature Support: python-feature-support.md
   - Format:
     - Definitions: terms.md
     - Spec: spec.md
-  - Iceberg on GitHub: https://github.com/apache/iceberg
+  - GitHub: https://github.com/apache/iceberg
   - ASF:
     - License: https://www.apache.org/licenses/
     - Security: https://www.apache.org/security/
@@ -84,3 +90,4 @@ nav:
     - Events: https://www.apache.org/events/current-event.html
 redirects:
   time-travel/index: snapshots/index
+  presto/index: trino/index

@@ -50,8 +50,9 @@ public class AllManifestsTable extends BaseMetadataTable {
       Types.NestedField.optional(7, "deleted_data_files_count", Types.IntegerType.get()),
       Types.NestedField.optional(8, "partition_summaries", Types.ListType.ofRequired(9, Types.StructType.of(
           Types.NestedField.required(10, "contains_null", Types.BooleanType.get()),
-          Types.NestedField.optional(11, "lower_bound", Types.StringType.get()),
-          Types.NestedField.optional(12, "upper_bound", Types.StringType.get())
+          Types.NestedField.required(11, "contains_nan", Types.BooleanType.get()),
+          Types.NestedField.optional(12, "lower_bound", Types.StringType.get()),
+          Types.NestedField.optional(13, "upper_bound", Types.StringType.get())
       )))
   );
 
@@ -89,6 +90,16 @@ public class AllManifestsTable extends BaseMetadataTable {
     return MANIFEST_FILE_SCHEMA;
   }
 
+  @Override
+  String metadataLocation() {
+    return ops.current().metadataFileLocation();
+  }
+
+  @Override
+  MetadataTableType metadataTableType() {
+    return MetadataTableType.ALL_MANIFESTS;
+  }
+
   public static class AllManifestsTableScan extends BaseAllMetadataTableScan {
 
     AllManifestsTableScan(TableOperations ops, Table table, Schema fileSchema) {
@@ -117,8 +128,8 @@ public class AllManifestsTable extends BaseMetadataTable {
     }
 
     @Override
-    protected long targetSplitSize(TableOperations ops) {
-      return ops.current().propertyAsLong(
+    public long targetSplitSize() {
+      return tableOps().current().propertyAsLong(
           TableProperties.METADATA_SPLIT_SIZE, TableProperties.METADATA_SPLIT_SIZE_DEFAULT);
     }
 

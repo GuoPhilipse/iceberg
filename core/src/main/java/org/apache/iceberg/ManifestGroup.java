@@ -27,7 +27,6 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.function.BiFunction;
 import java.util.function.Predicate;
-import java.util.stream.Collectors;
 import org.apache.iceberg.expressions.Evaluator;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
@@ -39,7 +38,6 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
-import org.apache.iceberg.relocated.com.google.common.collect.Streams;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.ParallelIterable;
 
@@ -166,7 +164,7 @@ class ManifestGroup {
 
     boolean dropStats = ManifestReader.dropStats(dataFilter, columns);
     if (!deleteFiles.isEmpty()) {
-      select(Streams.concat(columns.stream(), ManifestReader.STATS_COLUMNS.stream()).collect(Collectors.toList()));
+      select(ManifestReader.withStatsColumns(columns));
     }
 
     Iterable<CloseableIterable<FileScanTask>> tasks = entries((manifest, entries) -> {
@@ -213,7 +211,12 @@ class ManifestGroup {
               spec, caseSensitive);
         });
 
-    Evaluator evaluator = new Evaluator(DataFile.getType(EMPTY_STRUCT), fileFilter, caseSensitive);
+    Evaluator evaluator;
+    if (fileFilter != null && fileFilter != Expressions.alwaysTrue()) {
+      evaluator = new Evaluator(DataFile.getType(EMPTY_STRUCT), fileFilter, caseSensitive);
+    } else {
+      evaluator = null;
+    }
 
     Iterable<ManifestFile> matchingManifests = evalCache == null ? dataManifests :
         Iterables.filter(dataManifests, manifest -> evalCache.get(manifest.partitionSpecId()).eval(manifest));
@@ -255,7 +258,7 @@ class ManifestGroup {
                 entry -> entry.status() != ManifestEntry.Status.EXISTING);
           }
 
-          if (fileFilter != null && fileFilter != Expressions.alwaysTrue()) {
+          if (evaluator != null) {
             entries = CloseableIterable.filter(entries,
                 entry -> evaluator.eval((GenericDataFile) entry.file()));
           }

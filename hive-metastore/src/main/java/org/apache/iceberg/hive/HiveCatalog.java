@@ -19,12 +19,11 @@
 
 package org.apache.iceberg.hive;
 
-import java.io.Closeable;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.conf.HiveConf;
@@ -36,6 +35,8 @@ import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
 import org.apache.iceberg.BaseMetastoreCatalog;
+import org.apache.iceberg.BaseMetastoreTableOperations;
+import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
@@ -45,43 +46,64 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
-import org.apache.iceberg.relocated.com.google.common.base.Joiner;
+import org.apache.iceberg.hadoop.HadoopFileIO;
+import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class HiveCatalog extends BaseMetastoreCatalog implements Closeable, SupportsNamespaces {
+public class HiveCatalog extends BaseMetastoreCatalog implements SupportsNamespaces, Configurable {
   private static final Logger LOG = LoggerFactory.getLogger(HiveCatalog.class);
 
-  private final String name;
-  private final HiveClientPool clients;
-  private final Configuration conf;
-  private final StackTraceElement[] createStack;
-  private boolean closed;
+  private String name;
+  private Configuration conf;
+  private FileIO fileIO;
+  private ClientPool<HiveMetaStoreClient, TException> clients;
 
-  public HiveCatalog(Configuration conf) {
-    this.name = "hive";
-    this.clients = new HiveClientPool(conf);
-    this.conf = conf;
-    this.createStack = Thread.currentThread().getStackTrace();
-    this.closed = false;
+  public HiveCatalog() {
   }
 
-  public HiveCatalog(String name, String uri, int clientPoolSize, Configuration conf) {
-    this.name = name;
-    this.conf = new Configuration(conf);
-    // before building the client pool, overwrite the configuration's URIs if the argument is non-null
-    if (uri != null) {
-      this.conf.set(HiveConf.ConfVars.METASTOREURIS.varname, uri);
+  /**
+   * Hive Catalog constructor.
+   *
+   * @deprecated please use the no-arg constructor, setConf and initialize to construct the catalog. Will be removed in
+   * v0.13.0
+   * @param conf Hadoop Configuration
+   */
+  @Deprecated
+  public HiveCatalog(Configuration conf) {
+    this.name = "hive";
+    this.conf = conf;
+    this.fileIO = new HadoopFileIO(conf);
+    Map<String, String> properties = ImmutableMap.of(
+            CatalogProperties.CLIENT_POOL_CACHE_EVICTION_INTERVAL_MS,
+            conf.get(CatalogProperties.CLIENT_POOL_CACHE_EVICTION_INTERVAL_MS),
+            CatalogProperties.CLIENT_POOL_SIZE,
+            conf.get(CatalogProperties.CLIENT_POOL_SIZE)
+    );
+    this.clients = new CachedClientPool(conf, properties);
+  }
+
+  @Override
+  public void initialize(String inputName, Map<String, String> properties) {
+    this.name = inputName;
+    if (properties.containsKey(CatalogProperties.URI)) {
+      this.conf.set(HiveConf.ConfVars.METASTOREURIS.varname, properties.get(CatalogProperties.URI));
     }
 
-    this.clients = new HiveClientPool(clientPoolSize, this.conf);
-    this.createStack = Thread.currentThread().getStackTrace();
-    this.closed = false;
+    if (properties.containsKey(CatalogProperties.WAREHOUSE_LOCATION)) {
+      this.conf.set(HiveConf.ConfVars.METASTOREWAREHOUSE.varname, properties.get(CatalogProperties.WAREHOUSE_LOCATION));
+    }
+
+    String fileIOImpl = properties.get(CatalogProperties.FILE_IO_IMPL);
+    this.fileIO = fileIOImpl == null ? new HadoopFileIO(conf) : CatalogUtil.loadFileIO(fileIOImpl, properties, conf);
+
+    this.clients = new CachedClientPool(conf, properties);
   }
 
   @Override
@@ -91,9 +113,12 @@ public class HiveCatalog extends BaseMetastoreCatalog implements Closeable, Supp
     String database = namespace.level(0);
 
     try {
-      List<String> tables = clients.run(client -> client.getAllTables(database));
-      List<TableIdentifier> tableIdentifiers = tables.stream()
-          .map(t -> TableIdentifier.of(namespace, t))
+      List<String> tableNames = clients.run(client -> client.getAllTables(database));
+      List<Table> tableObjects = clients.run(client -> client.getTableObjectsByName(database, tableNames));
+      List<TableIdentifier> tableIdentifiers = tableObjects.stream()
+          .filter(table -> table.getParameters() == null ? false : BaseMetastoreTableOperations.ICEBERG_TABLE_TYPE_VALUE
+              .equalsIgnoreCase(table.getParameters().get(BaseMetastoreTableOperations.TABLE_TYPE_PROP)))
+          .map(table -> TableIdentifier.of(namespace, table.getTableName()))
           .collect(Collectors.toList());
 
       LOG.debug("Listing of namespace: {} resulted in the following tables: {}", namespace, tableIdentifiers);
@@ -395,7 +420,7 @@ public class HiveCatalog extends BaseMetastoreCatalog implements Closeable, Supp
   public TableOperations newTableOps(TableIdentifier tableIdentifier) {
     String dbName = tableIdentifier.namespace().level(0);
     String tableName = tableIdentifier.name();
-    return new HiveTableOperations(conf, clients, name, dbName, tableName);
+    return new HiveTableOperations(conf, clients, fileIO, name, dbName, tableName);
   }
 
   @Override
@@ -422,15 +447,18 @@ public class HiveCatalog extends BaseMetastoreCatalog implements Closeable, Supp
     }
 
     // Otherwise stick to the {WAREHOUSE_DIR}/{DB_NAME}.db/{TABLE_NAME} path
-    String warehouseLocation = conf.get("hive.metastore.warehouse.dir");
-    Preconditions.checkNotNull(
-        warehouseLocation,
-        "Warehouse location is not set: hive.metastore.warehouse.dir=null");
+    String warehouseLocation = getWarehouseLocation();
     return String.format(
         "%s/%s.db/%s",
         warehouseLocation,
         tableIdentifier.namespace().levels()[0],
         tableIdentifier.name());
+  }
+
+  private String getWarehouseLocation() {
+    String warehouseLocation = conf.get(HiveConf.ConfVars.METASTOREWAREHOUSE.varname);
+    Preconditions.checkNotNull(warehouseLocation, "Warehouse location is not set: hive.metastore.warehouse.dir=null");
+    return warehouseLocation;
   }
 
   private Map<String, String> convertToMetadata(Database database) {
@@ -447,17 +475,15 @@ public class HiveCatalog extends BaseMetastoreCatalog implements Closeable, Supp
   }
 
   Database convertToDatabase(Namespace namespace, Map<String, String> meta) {
-    String warehouseLocation = conf.get("hive.metastore.warehouse.dir");
-
     if (!isValidateNamespace(namespace)) {
       throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
     }
 
-    Database database  = new Database();
+    Database database = new Database();
     Map<String, String> parameter = Maps.newHashMap();
 
     database.setName(namespace.level(0));
-    database.setLocationUri(new Path(warehouseLocation, namespace.level(0)).toString() + ".db");
+    database.setLocationUri(new Path(getWarehouseLocation(), namespace.level(0)).toString() + ".db");
 
     meta.forEach((key, value) -> {
       if (key.equals("comment")) {
@@ -474,32 +500,21 @@ public class HiveCatalog extends BaseMetastoreCatalog implements Closeable, Supp
 
     return database;
   }
-
-  @Override
-  public void close() {
-    if (!closed) {
-      clients.close();
-      closed = true;
-    }
-  }
-
-  @SuppressWarnings("checkstyle:NoFinalizer")
-  @Override
-  protected void finalize() throws Throwable {
-    super.finalize();
-    if (!closed) {
-      close(); // releasing resources is more important than printing the warning
-      String trace = Joiner.on("\n\t").join(
-          Arrays.copyOfRange(createStack, 1, createStack.length));
-      LOG.warn("Unclosed input stream created by:\n\t{}", trace);
-    }
-  }
-
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("name", name)
         .add("uri", this.conf.get(HiveConf.ConfVars.METASTOREURIS.varname))
         .toString();
+  }
+
+  @Override
+  public void setConf(Configuration conf) {
+    this.conf = new Configuration(conf);
+  }
+
+  @Override
+  public Configuration getConf() {
+    return conf;
   }
 }

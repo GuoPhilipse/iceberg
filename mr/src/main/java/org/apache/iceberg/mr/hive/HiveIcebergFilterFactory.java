@@ -33,11 +33,13 @@ import org.apache.iceberg.common.DynFields;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.util.DateTimeUtil;
+import org.apache.iceberg.util.NaNUtil;
 
 import static org.apache.iceberg.expressions.Expressions.and;
 import static org.apache.iceberg.expressions.Expressions.equal;
 import static org.apache.iceberg.expressions.Expressions.greaterThanOrEqual;
 import static org.apache.iceberg.expressions.Expressions.in;
+import static org.apache.iceberg.expressions.Expressions.isNaN;
 import static org.apache.iceberg.expressions.Expressions.isNull;
 import static org.apache.iceberg.expressions.Expressions.lessThan;
 import static org.apache.iceberg.expressions.Expressions.lessThanOrEqual;
@@ -95,7 +97,8 @@ public class HiveIcebergFilterFactory {
     String column = leaf.getColumnName();
     switch (leaf.getOperator()) {
       case EQUALS:
-        return equal(column, leafToLiteral(leaf));
+        Object literal = leafToLiteral(leaf);
+        return NaNUtil.isNaN(literal) ? isNaN(column) : equal(column, literal);
       case LESS_THAN:
         return lessThan(column, leafToLiteral(leaf));
       case LESS_THAN_EQUALS:
@@ -127,6 +130,9 @@ public class HiveIcebergFilterFactory {
       case FLOAT:
         return leaf.getLiteral();
       case DATE:
+        if (leaf.getLiteral() instanceof java.sql.Date) {
+          return daysFromDate((Date) leaf.getLiteral());
+        }
         return daysFromTimestamp((Timestamp) leaf.getLiteral());
       case TIMESTAMP:
         return microsFromTimestamp((Timestamp) LITERAL_FIELD.get(leaf));
@@ -165,15 +171,24 @@ public class HiveIcebergFilterFactory {
     return hiveDecimalWritable.getHiveDecimal().bigDecimalValue().setScale(hiveDecimalWritable.scale());
   }
 
+  // Hive uses `java.sql.Date.valueOf(lit.toString());` to convert a literal to Date
+  // Which uses `java.util.Date()` internally to create the object and that uses the TimeZone.getDefaultRef()
+  // To get back the expected date we have to use the LocalDate which gets rid of the TimeZone misery as it uses
+  // the year/month/day to generate the object
   private static int daysFromDate(Date date) {
     return DateTimeUtil.daysFromDate(date.toLocalDate());
   }
 
+  // Hive uses `java.sql.Timestamp.valueOf(lit.toString());` to convert a literal to Timestamp
+  // Which again uses `java.util.Date()` internally to create the object which uses the TimeZone.getDefaultRef()
+  // To get back the expected timestamp we have to use the LocalDateTime which gets rid of the TimeZone misery
+  // as it uses the year/month/day/hour/min/sec/nanos to generate the object
   private static int daysFromTimestamp(Timestamp timestamp) {
-    return DateTimeUtil.daysFromInstant(timestamp.toInstant());
+    return DateTimeUtil.daysFromDate(timestamp.toLocalDateTime().toLocalDate());
   }
 
+  // We have to use the LocalDateTime to get the micros. See the comment above.
   private static long microsFromTimestamp(Timestamp timestamp) {
-    return DateTimeUtil.microsFromInstant(timestamp.toInstant());
+    return DateTimeUtil.microsFromTimestamp(timestamp.toLocalDateTime());
   }
 }

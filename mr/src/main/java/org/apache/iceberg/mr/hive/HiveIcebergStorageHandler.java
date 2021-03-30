@@ -19,11 +19,12 @@
 
 package org.apache.iceberg.mr.hive;
 
+import java.io.Serializable;
+import java.util.Collection;
 import java.util.Map;
 import java.util.Properties;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.metastore.HiveMetaHook;
-import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.metadata.HiveStorageHandler;
 import org.apache.hadoop.hive.ql.metadata.HiveStoragePredicateHandler;
 import org.apache.hadoop.hive.ql.plan.ExprNodeDesc;
@@ -35,14 +36,22 @@ import org.apache.hadoop.hive.serde2.Deserializer;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.OutputFormat;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.mr.Catalogs;
 import org.apache.iceberg.mr.InputFormatConfig;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.base.Splitter;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.util.SerializationUtil;
 
 public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, HiveStorageHandler {
+  private static final Splitter TABLE_NAME_SPLITTER = Splitter.on("..");
+  private static final String TABLE_NAME_SEPARATOR = "..";
 
-  private static final String NAME = "name";
+  static final String WRITE_KEY = "HiveIcebergStorageHandler_write";
 
   private Configuration conf;
 
@@ -63,27 +72,30 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
 
   @Override
   public HiveMetaHook getMetaHook() {
-    return null;
+    return new HiveIcebergMetaHook(conf);
   }
 
   @Override
-  public HiveAuthorizationProvider getAuthorizationProvider() throws HiveException {
+  public HiveAuthorizationProvider getAuthorizationProvider() {
     return null;
   }
 
   @Override
   public void configureInputJobProperties(TableDesc tableDesc, Map<String, String> map) {
-    Properties props = tableDesc.getProperties();
-    Table table = Catalogs.loadTable(conf, props);
-
-    map.put(InputFormatConfig.TABLE_IDENTIFIER, props.getProperty(NAME));
-    map.put(InputFormatConfig.TABLE_LOCATION, table.location());
-    map.put(InputFormatConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
+    overlayTableProperties(conf, tableDesc, map);
   }
 
   @Override
   public void configureOutputJobProperties(TableDesc tableDesc, Map<String, String> map) {
-
+    overlayTableProperties(conf, tableDesc, map);
+    // For Tez, setting the committer here is enough to make sure it'll be part of the jobConf
+    map.put("mapred.output.committer.class", HiveIcebergOutputCommitter.class.getName());
+    // For MR, the jobConf is set only in configureJobConf, so we're setting the write key here to detect it over there
+    map.put(WRITE_KEY, "true");
+    // Putting the key into the table props as well, so that projection pushdown can be determined on a
+    // table-level and skipped only for output tables in HiveIcebergSerde. Properties from the map will be present in
+    // the serde config for all tables in the query, not just the output tables, so we can't rely on that in the serde.
+    tableDesc.getProperties().put(WRITE_KEY, "true");
   }
 
   @Override
@@ -91,9 +103,24 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
 
   }
 
+  // Override annotation commented out, since this interface method has been introduced only in Hive 3
+  // @Override
+  public void configureInputJobCredentials(TableDesc tableDesc, Map<String, String> secrets) {
+
+  }
+
   @Override
   public void configureJobConf(TableDesc tableDesc, JobConf jobConf) {
+    if (tableDesc != null && tableDesc.getProperties() != null &&
+        tableDesc.getProperties().get(WRITE_KEY) != null) {
+      Preconditions.checkArgument(!tableDesc.getTableName().contains(TABLE_NAME_SEPARATOR),
+          "Can not handle table " + tableDesc.getTableName() + ". Its name contains '" + TABLE_NAME_SEPARATOR + "'");
+      String tables = jobConf.get(InputFormatConfig.OUTPUT_TABLES);
+      tables = tables == null ? tableDesc.getTableName() : tables + TABLE_NAME_SEPARATOR + tableDesc.getTableName();
 
+      jobConf.set("mapred.output.committer.class", HiveIcebergOutputCommitter.class.getName());
+      jobConf.set(InputFormatConfig.OUTPUT_TABLES, tables);
+    }
   }
 
   @Override
@@ -123,5 +150,77 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
     predicate.residualPredicate = (ExprNodeGenericFuncDesc) exprNodeDesc;
     predicate.pushedPredicate = (ExprNodeGenericFuncDesc) exprNodeDesc;
     return predicate;
+  }
+
+  /**
+   * Returns the Table serialized to the configuration based on the table name.
+   * @param config The configuration used to get the data from
+   * @param name The name of the table we need as returned by TableDesc.getTableName()
+   * @return The Table
+   */
+  public static Table table(Configuration config, String name) {
+    return SerializationUtil.deserializeFromBase64(config.get(InputFormatConfig.SERIALIZED_TABLE_PREFIX + name));
+  }
+
+  /**
+   * Returns the names of the output tables stored in the configuration.
+   * @param config The configuration used to get the data from
+   * @return The collection of the table names as returned by TableDesc.getTableName()
+   */
+  public static Collection<String> outputTables(Configuration config) {
+    return TABLE_NAME_SPLITTER.splitToList(config.get(InputFormatConfig.OUTPUT_TABLES));
+  }
+
+  /**
+   * Returns the Table Schema serialized to the configuration.
+   * @param config The configuration used to get the data from
+   * @return The Table Schema object
+   */
+  public static Schema schema(Configuration config) {
+    return SchemaParser.fromJson(config.get(InputFormatConfig.TABLE_SCHEMA));
+  }
+
+  /**
+   * Stores the serializable table data in the configuration.
+   * Currently the following is handled:
+   * <ul>
+   *   <li>- Table - in case the table is serializable</li>
+   *   <li>- Location</li>
+   *   <li>- Schema</li>
+   *   <li>- Partition specification</li>
+   *   <li>- FileIO for handling table files</li>
+   *   <li>- Location provider used for file generation</li>
+   *   <li>- Encryption manager for encryption handling</li>
+   * </ul>
+   * @param configuration The configuration storing the catalog information
+   * @param tableDesc The table which we want to store to the configuration
+   * @param map The map of the configuration properties which we append with the serialized data
+   */
+  @VisibleForTesting
+  static void overlayTableProperties(Configuration configuration, TableDesc tableDesc, Map<String, String> map) {
+    Properties props = tableDesc.getProperties();
+    Table table = Catalogs.loadTable(configuration, props);
+    String schemaJson = SchemaParser.toJson(table.schema());
+
+    Maps.fromProperties(props).entrySet().stream()
+        .filter(entry -> !map.containsKey(entry.getKey())) // map overrides tableDesc properties
+        .forEach(entry -> map.put(entry.getKey(), entry.getValue()));
+
+    map.put(InputFormatConfig.TABLE_IDENTIFIER, props.getProperty(Catalogs.NAME));
+    map.put(InputFormatConfig.TABLE_LOCATION, table.location());
+    map.put(InputFormatConfig.TABLE_SCHEMA, schemaJson);
+
+    if (table instanceof Serializable) {
+      map.put(InputFormatConfig.SERIALIZED_TABLE_PREFIX + tableDesc.getTableName(),
+          SerializationUtil.serializeToBase64(table));
+    }
+
+    // We need to remove this otherwise the job.xml will be invalid as column comments are separated with '\0' and
+    // the serialization utils fail to serialize this character
+    map.remove("columns.comments");
+
+    // save schema into table props as well to avoid repeatedly hitting the HMS during serde initializations
+    // this is an exception to the interface documentation, but it's a safe operation to add this property
+    props.put(InputFormatConfig.TABLE_SCHEMA, schemaJson);
   }
 }

@@ -32,6 +32,7 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.expressions.ExpressionVisitors.BoundExpressionVisitor;
 import org.apache.iceberg.types.Comparators;
 import org.apache.iceberg.types.Conversions;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.util.BinaryUtil;
 
@@ -48,6 +49,8 @@ import static org.apache.iceberg.expressions.Expressions.rewriteNot;
  * return value of {@code eval} is false.
  */
 public class ManifestEvaluator {
+  private static final int IN_PREDICATE_LIMIT = 200;
+
   private final StructType struct;
   private final Expression expr;
 
@@ -130,11 +133,37 @@ public class ManifestEvaluator {
     @Override
     public <T> Boolean notNull(BoundReference<T> ref) {
       int pos = Accessors.toPosition(ref.accessor());
-      // containsNull encodes whether at least one partition value is null, lowerBound is null if
-      // all partition values are null.
-      ByteBuffer lowerBound = stats.get(pos).lowerBound();
-      if (lowerBound == null) {
-        return ROWS_CANNOT_MATCH; // all values are null
+
+      if (allValuesAreNull(stats.get(pos), ref.type().typeId())) {
+        return ROWS_CANNOT_MATCH;
+      }
+
+      return ROWS_MIGHT_MATCH;
+    }
+
+    @Override
+    public <T> Boolean isNaN(BoundReference<T> ref) {
+      int pos = Accessors.toPosition(ref.accessor());
+
+      if (stats.get(pos).containsNaN() != null && !stats.get(pos).containsNaN()) {
+        return ROWS_CANNOT_MATCH;
+      }
+
+      if (allValuesAreNull(stats.get(pos), ref.type().typeId())) {
+        return ROWS_CANNOT_MATCH;
+      }
+
+      return ROWS_MIGHT_MATCH;
+    }
+
+    @Override
+    public <T> Boolean notNaN(BoundReference<T> ref) {
+      PartitionFieldSummary fieldSummary = stats.get(Accessors.toPosition(ref.accessor()));
+
+      // if containsNaN is true, containsNull is false and lowerBound is null, all values are NaN
+      if (fieldSummary.containsNaN() != null && fieldSummary.containsNaN() &&
+          !fieldSummary.containsNull() && fieldSummary.lowerBound() == null) {
+        return ROWS_CANNOT_MATCH;
       }
 
       return ROWS_MIGHT_MATCH;
@@ -252,6 +281,11 @@ public class ManifestEvaluator {
 
       Collection<T> literals = literalSet;
 
+      if (literals.size() > IN_PREDICATE_LIMIT) {
+        // skip evaluating the predicate if the number of values is too big
+        return ROWS_MIGHT_MATCH;
+      }
+
       T lower = Conversions.fromByteBuffer(ref.type(), fieldStats.lowerBound());
       literals = literals.stream().filter(v -> ref.comparator().compare(lower, v) <= 0).collect(Collectors.toList());
       if (literals.isEmpty()) { // if all values are less than lower bound, rows cannot match.
@@ -304,6 +338,19 @@ public class ManifestEvaluator {
       }
 
       return ROWS_MIGHT_MATCH;
+    }
+
+    private boolean allValuesAreNull(PartitionFieldSummary summary, Type.TypeID typeId) {
+      // containsNull encodes whether at least one partition value is null,
+      // lowerBound is null if all partition values are null
+      boolean allNull = summary.containsNull() && summary.lowerBound() == null;
+
+      if (allNull && (Type.TypeID.DOUBLE.equals(typeId) || Type.TypeID.FLOAT.equals(typeId))) {
+        // floating point types may include NaN values, which we check separately.
+        // In case bounds don't include NaN value, containsNaN needs to be checked against.
+        allNull = summary.containsNaN() != null && !summary.containsNaN();
+      }
+      return allNull;
     }
   }
 }
